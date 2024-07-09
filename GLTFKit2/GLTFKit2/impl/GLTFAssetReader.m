@@ -1,8 +1,11 @@
 
 #import "GLTFAssetReader.h"
+#import "GLTFMeshoptSupport.h"
 
 #define CGLTF_IMPLEMENTATION
 #import "cgltf.h"
+
+static NSString *const GLTFExtensionEXTMeshoptCompression = @"EXT_meshopt_compression";
 
 @interface GLTFUniqueNameGenerator : NSObject
 - (NSString *)nextUniqueNameWithPrefix:(NSString *)prefix;
@@ -322,7 +325,6 @@ NSDictionary *GLTFConvertExtensions(cgltf_extension *extensions, size_t count, N
     return extensionsMap;
 }
 
-
 static dispatch_queue_t _loaderQueue;
 
 @implementation GLTFAssetReader
@@ -361,8 +363,8 @@ static dispatch_queue_t _loaderQueue;
     return self;
 }
 
-- (void)syncLoadAssetWithURL:(NSURL * _Nullable)assetURL
-                        data:(NSData * _Nullable)data
+- (void)syncLoadAssetWithURL:(nullable NSURL *)assetURL
+                        data:(nullable NSData *)data
                      options:(NSDictionary<GLTFAssetLoadingOption, id> *)options
                      handler:(nullable GLTFAssetLoadingHandler)handler
 {
@@ -385,38 +387,55 @@ static dispatch_queue_t _loaderQueue;
         return;
     }
 
-    NSData *internalData = data ?: [NSData dataWithContentsOfURL:assetURL];
-    if (internalData == nil) {
-        NSError *error = [NSError errorWithDomain:GLTFErrorDomain code:GLTFErrorCodeFailedToLoad userInfo:nil];
-        handler(1.0, GLTFAssetStatusError, nil, error, &stop);
-        return;
-    }
+    @try {
+        NSError *internalError = nil;
+        NSData *internalData = data ?: [NSData dataWithContentsOfURL:assetURL
+                                                             options:(NSDataReadingOptions)0
+                                                               error:&internalError];
+        if (internalData == nil) {
+            NSMutableDictionary *userInfo = [@{ NSLocalizedDescriptionKey : @"Failed to open file" } mutableCopy];
+            if (internalError) {
+                userInfo[NSUnderlyingErrorKey] = internalError;
+            }
+            NSError *error = [NSError errorWithDomain:GLTFErrorDomain code:GLTFErrorCodeFailedToLoad userInfo:userInfo];
+            handler(1.0, GLTFAssetStatusError, nil, error, &stop);
+            return;
+        }
 
-    cgltf_options parseOptions = {0};
-    parseOptions.file.read = self.assetDirectoryURL ? GLTFReadFileSecurityScoped : GLTFReadFile;
-    parseOptions.file.user_data = (__bridge void *)self;
-    cgltf_result result = cgltf_parse(&parseOptions, internalData.bytes, internalData.length, &gltf);
+        cgltf_options parseOptions = {0};
+        parseOptions.file.read = self.assetDirectoryURL ? GLTFReadFileSecurityScoped : GLTFReadFile;
+        parseOptions.file.user_data = (__bridge void *)self;
+        cgltf_result result = cgltf_parse(&parseOptions, internalData.bytes, internalData.length, &gltf);
 
-    if (result != cgltf_result_success) {
-        NSError *error = GLTFErrorForCGLTFStatus(result, self.lastAccessedPath);
-        handler(1.0, GLTFAssetStatusError, nil, error, &stop);
-    } else {
-        result = cgltf_load_buffers(&parseOptions, gltf, assetURL.fileSystemRepresentation);
         if (result != cgltf_result_success) {
             NSError *error = GLTFErrorForCGLTFStatus(result, self.lastAccessedPath);
             handler(1.0, GLTFAssetStatusError, nil, error, &stop);
         } else {
-            NSError *error = nil;
-            [self convertAsset:&error];
-            if (error == nil) {
-                handler(1.0, GLTFAssetStatusComplete, self.asset, nil, &stop);
-            } else {
+            result = cgltf_load_buffers(&parseOptions, gltf, assetURL.fileSystemRepresentation);
+            if (result != cgltf_result_success) {
+                NSError *error = GLTFErrorForCGLTFStatus(result, self.lastAccessedPath);
                 handler(1.0, GLTFAssetStatusError, nil, error, &stop);
+            } else {
+                NSError *error = nil;
+                [self convertAsset:&error];
+                if (error == nil) {
+                    handler(1.0, GLTFAssetStatusComplete, self.asset, nil, &stop);
+                } else {
+                    handler(1.0, GLTFAssetStatusError, nil, error, &stop);
+                }
             }
         }
     }
-
-    cgltf_free(gltf);
+    @catch (NSException *exception) {
+        NSString *description = [NSString stringWithFormat:@"An exception occurred when loading (%@)", exception.reason];
+        NSError *exceptionError = [NSError errorWithDomain:GLTFErrorDomain
+                                                      code:GLTFErrorCodeFailedToLoad
+                                                  userInfo:@{ NSLocalizedDescriptionKey : description }];
+        handler(1.0, GLTFAssetStatusError, nil, exceptionError, &stop);
+    }
+    @finally {
+        cgltf_free(gltf);
+    }
 }
 
 - (NSArray *)convertBuffers {
@@ -432,6 +451,11 @@ static dispatch_queue_t _loaderQueue;
         buffer.name = b->name ? GLTFUnescapeJSONString(b->name)
                               : [self.nameGenerator nextUniqueNameWithPrefix:@"Buffer"];
         buffer.extensions = GLTFConvertExtensions(b->extensions, b->extensions_count, nil);
+        NSDictionary *meshoptExtension = buffer.extensions[GLTFExtensionEXTMeshoptCompression];
+        if (meshoptExtension) {
+            BOOL isFallback = [meshoptExtension[@"fallback"] boolValue];
+            buffer.meshoptFallback = isFallback;
+        }
         buffer.extras = GLTFObjectFromExtras(gltf->json, b->extras, nil);
         [buffers addObject:buffer];
     }
@@ -440,6 +464,22 @@ static dispatch_queue_t _loaderQueue;
 
 - (NSArray *)convertBufferViews {
     NSMutableArray *bufferViews = [NSMutableArray arrayWithCapacity:gltf->buffer_views_count];
+
+    // If we have meshopt-encoded buffer views, we need somewhere to write their decoded data.
+    // If the buffer referenced by a buffer view is tagged as a fallback, it shouldn't have
+    // a URI and we shouldn't have allocated any storage to it. Now that we are loading buffer
+    // views, we allocate mutable storage for each fallback buffer so that we can write into
+    // them during meshopt decompression. The extension spec requires that the buffer referenced
+    // by a buffer view has a byte length large enough to hold any buffer views that reference it.
+    // If a fallback buffer has pre-existing data (an unusual configuration), we ignore its contents
+    // and create ad-hoc buffers for each meshopt-compressed buffer view.
+    NSMutableDictionary *mutableDatasForBuffers = [NSMutableDictionary dictionary];
+    for (GLTFBuffer *buffer in self.asset.buffers) {
+        if (buffer.isMeshoptFallback && (buffer.data == nil)) {
+            mutableDatasForBuffers[buffer.identifier] = [NSMutableData dataWithLength:buffer.length];
+        }
+    }
+
     for (int i = 0; i < gltf->buffer_views_count; ++i) {
         cgltf_buffer_view *bv = gltf->buffer_views + i;
         size_t bufferIndex = bv->buffer - gltf->buffers;
@@ -451,8 +491,51 @@ static dispatch_queue_t _loaderQueue;
                                    : [self.nameGenerator nextUniqueNameWithPrefix:@"BufferView"];
         bufferView.extensions = GLTFConvertExtensions(bv->extensions, bv->extensions_count, nil);
         bufferView.extras = GLTFObjectFromExtras(gltf->json, bv->extras, nil);
+
+        if (bv->has_meshopt_compression) {
+            cgltf_meshopt_compression *mo = &bv->meshopt_compression;
+            size_t sourceBufferIndex = mo->buffer - gltf->buffers;
+            GLTFBuffer *sourceBuffer = self.asset.buffers[sourceBufferIndex];
+            GLTFMeshoptCompression *meshopt = [[GLTFMeshoptCompression alloc] initWithBuffer:sourceBuffer
+                                                                                      length:mo->size
+                                                                                      stride:mo->stride
+                                                                                       count:mo->count
+                                                                                        mode:(GLTFMeshoptCompressionMode)mo->mode];
+            meshopt.offset = mo->offset;
+            meshopt.filter = (GLTFMeshoptCompressionFilter)mo->filter;
+            bufferView.meshoptCompression = meshopt;
+
+            NSError *error = nil;
+            NSMutableData *targetBufferData = mutableDatasForBuffers[bufferView.buffer.identifier];
+            if (targetBufferData) {
+                uint8_t *targetBufferViewPtr = targetBufferData.mutableBytes + bufferView.offset;
+                GLTFMeshoptDecodeBufferView(bufferView, targetBufferViewPtr, &error);
+            } else {
+                // We don't have a fallback buffer, so we have nowhere to write our decoded data, so allocate some.
+                targetBufferData = [NSMutableData dataWithLength:bufferView.length];
+                GLTFMeshoptDecodeBufferView(bufferView, targetBufferData.mutableBytes, &error);
+
+                // Create a new ad-hoc buffer to wrap the buffer view's decompressed storage and patch the buffer view
+                GLTFBuffer *adhocBuffer = [[GLTFBuffer alloc] initWithData:targetBufferData];
+                adhocBuffer.meshoptFallback = YES;
+                bufferView.buffer = adhocBuffer;
+                bufferView.offset = 0;
+
+                self.asset.buffers = [self.asset.buffers arrayByAddingObject:adhocBuffer];
+            }
+        }
+
         [bufferViews addObject:bufferView];
     }
+
+    // Write back any storage that was allocated to a fallback buffer now that it's
+    // been populated by its referencing meshopt-compressed buffer views
+    for (GLTFBuffer *buffer in self.asset.buffers) {
+        if (buffer.isMeshoptFallback && buffer.data == nil) {
+            buffer.data = mutableDatasForBuffers[buffer.identifier];
+        }
+    }
+
     return bufferViews;
 }
 
@@ -578,17 +661,21 @@ static dispatch_queue_t _loaderQueue;
     NSMutableArray *textures = [NSMutableArray arrayWithCapacity:gltf->textures_count];
     for (int i = 0; i < gltf->textures_count; ++i) {
         cgltf_texture *t = gltf->textures + i;
-        GLTFImage *image = nil;
+        GLTFImage *image = nil, *basisUImage = nil;
         GLTFTextureSampler *sampler = nil;
         if (t->image) {
             size_t imageIndex = t->image - gltf->images;
             image = self.asset.images[imageIndex];
         }
+        if (t->has_basisu) {
+            size_t imageIndex = t->basisu_image - gltf->images;
+            basisUImage = self.asset.images[imageIndex];
+        }
         if (t->sampler) {
             size_t samplerIndex = t->sampler - gltf->samplers;
             sampler = self.asset.samplers[samplerIndex];
         }
-        GLTFTexture *texture = [[GLTFTexture alloc] initWithSource:image];
+        GLTFTexture *texture = [[GLTFTexture alloc] initWithSource:image basisUSource:basisUImage];
         texture.sampler = sampler;
         texture.name = t->name ? GLTFUnescapeJSONString(t->name)
                                : [self.nameGenerator nextUniqueNameWithPrefix:@"Texture"];
@@ -616,8 +703,6 @@ static dispatch_queue_t _loaderQueue;
         }
         params.transform = transform;
     }
-    params.extensions = GLTFConvertExtensions(tv->extensions, tv->extensions_count, nil);
-    params.extras = GLTFObjectFromExtras(gltf->json, tv->extras, nil);
     return params;
 }
 
@@ -647,6 +732,9 @@ static dispatch_queue_t _loaderQueue;
         material.doubleSided = (BOOL)m->double_sided;
         if (m->has_ior) {
             material.indexOfRefraction = @(m->ior.ior);
+        }
+        if (m->has_dispersion) {
+            material.dispersion = @(m->dispersion.dispersion);
         }
         if (m->has_pbr_metallic_roughness) {
             GLTFPBRMetallicRoughnessParams *pbr = [GLTFPBRMetallicRoughnessParams new];
@@ -750,6 +838,15 @@ static dispatch_queue_t _loaderQueue;
             }
             material.iridescence = iridesence;
         }
+        if (m->has_anisotropy) {
+            GLTFAnisotropyParams *anisotropy = [GLTFAnisotropyParams new];
+            anisotropy.strength = m->anisotropy.anisotropy_strength;
+            anisotropy.rotation = m->anisotropy.anisotropy_rotation;
+            if (m->anisotropy.anisotropy_texture.texture) {
+                anisotropy.anisotropyTexture = [self textureParamsFromTextureView:&m->anisotropy.anisotropy_texture];
+            }
+            material.anisotropy = anisotropy;
+        }
         if (m->unlit) {
             material.unlit = YES;
         }
@@ -803,13 +900,17 @@ static dispatch_queue_t _loaderQueue;
                 dracoPrimitive = [DecompressorClass newPrimitiveForCompressedBufferView:bufferView
                                                                            attributeMap:dracoAttributes];
             }
-            NSMutableDictionary *attributes = [NSMutableDictionary dictionary];
+            NSMutableArray *attributes = [NSMutableArray array];
             for (int k = 0; k < p->attributes_count; ++k) {
                 cgltf_attribute *a = p->attributes + k;
                 NSString *attrName = [NSString stringWithUTF8String:a->name];
                 size_t attrIndex = a->data - gltf->accessors;
                 GLTFAccessor *attrAccessor = self.asset.accessors[attrIndex];
-                attributes[attrName] = dracoPrimitive.attributes[attrName] ?: attrAccessor;
+                GLTFAttribute *_Nullable attribute = [dracoPrimitive attributeForName:attrName];
+                if (attribute == nil) {
+                    attribute = [[GLTFAttribute alloc] initWithName:attrName accessor:attrAccessor];
+                }
+                [attributes addObject:attribute];
             }
             GLTFPrimitive *primitive = nil;
             if (p->indices) {
@@ -823,18 +924,19 @@ static dispatch_queue_t _loaderQueue;
                 size_t materialIndex = p->material - gltf->materials;
                 primitive.material = self.asset.materials[materialIndex];
             }
-            NSMutableArray *targets = [NSMutableArray array];
+            NSMutableArray<NSArray<GLTFAttribute *> *> *targets = [NSMutableArray array];
             for (int k = 0; k < p->targets_count; ++k) {
-                NSMutableDictionary *target = [NSMutableDictionary dictionary];
+                NSMutableArray<GLTFAttribute *> *target = [NSMutableArray array];
                 cgltf_morph_target *mt = p->targets + k;
                 for (int l = 0; l < mt->attributes_count; ++l) {
                     cgltf_attribute *a = mt->attributes + l;
                     NSString *attrName = [NSString stringWithUTF8String:a->name];
                     size_t attrIndex = a->data - gltf->accessors;
                     GLTFAccessor *attrAccessor = self.asset.accessors[attrIndex];
-                    target[attrName] = attrAccessor;
+                    GLTFAttribute *attr = [[GLTFAttribute alloc] initWithName:attrName accessor:attrAccessor];
+                    [target addObject:attr];
                 }
-                [targets addObject:target];
+                [targets addObject:[target copy]];
             }
             if (p->mappings_count > 0) {
                 NSMutableArray *materialMappings = [NSMutableArray arrayWithCapacity:p->mappings_count];
@@ -974,6 +1076,21 @@ static dispatch_queue_t _loaderQueue;
             node.matrix = transform;
         }
         // TODO: morph target weights
+        if (n->has_mesh_gpu_instancing) {
+            cgltf_mesh_gpu_instancing *mi = &n->mesh_gpu_instancing;
+            NSMutableArray *attributes = [NSMutableArray array];
+            for (int j = 0; j < mi->attributes_count; ++j) {
+                cgltf_attribute *a = mi->attributes + j;
+                NSString *attrName = [NSString stringWithUTF8String:a->name];
+                size_t attrIndex = a->data - gltf->accessors;
+                GLTFAccessor *attrAccessor = self.asset.accessors[attrIndex];
+                GLTFAttribute *attr = [[GLTFAttribute alloc] initWithName:attrName accessor:attrAccessor];
+                [attributes addObject:attr];
+            }
+            GLTFMeshInstances *instances = [GLTFMeshInstances new];
+            instances.attributes = [attributes copy];
+            node.meshInstances = instances;
+        }
         node.name = n->name ? GLTFUnescapeJSONString(n->name)
                             : [self.nameGenerator nextUniqueNameWithPrefix:@"Node"];
         node.extensions = GLTFConvertExtensions(n->extensions, n->extensions_count, nil);
@@ -1102,19 +1219,33 @@ static dispatch_queue_t _loaderQueue;
 }
 
 - (BOOL)validateRequiredExtensions:(NSError **)error {
-    NSArray *supportedExtensions = @[
-        @"KHR_draco_mesh_compression",
+    NSMutableArray *supportedExtensions = [NSMutableArray arrayWithObjects:
+        GLTFExtensionEXTMeshoptCompression,
+        @"EXT_mesh_gpu_instancing",
         @"KHR_emissive_strength",
-        @"KHR_materials_ior",
         @"KHR_lights_punctual",
+        @"KHR_materials_anisotropy",
         @"KHR_materials_clearcoat",
+        @"KHR_materials_dispersion",
+        @"KHR_materials_ior",
+        @"KHR_materials_iridescence",
+        @"KHR_materials_sheen",
         @"KHR_materials_specular",
         @"KHR_materials_transmission",
         @"KHR_materials_unlit",
         @"KHR_materials_variants",
+        @"KHR_materials_volume",
+        @"KHR_mesh_quantization",
         @"KHR_texture_transform",
         @"KHR_materials_pbrSpecularGlossiness", // deprecated
+        nil
     ];
+    if ([GLTFAsset dracoDecompressorClassName] != nil) {
+        [supportedExtensions addObject:@"KHR_draco_mesh_compression"];
+    }
+#if defined(GLTF_BUILD_WITH_KTX2)
+    [supportedExtensions addObject:@"KHR_texture_basisu"];
+#endif
     NSMutableArray *unsupportedExtensions = [NSMutableArray array];
     for (NSString *requiredExtension in self.asset.extensionsRequired) {
         if (![supportedExtensions containsObject:requiredExtension]) {

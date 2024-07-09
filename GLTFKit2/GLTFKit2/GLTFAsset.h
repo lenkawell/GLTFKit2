@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <simd/simd.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <Metal/Metal.h>
 
 #import <GLTFKit2/GLTFTypes.h>
 
@@ -50,6 +51,19 @@ extern GLTFAnimationPath GLTFAnimationPathTranslation;
 extern GLTFAnimationPath GLTFAnimationPathRotation;
 extern GLTFAnimationPath GLTFAnimationPathScale;
 extern GLTFAnimationPath GLTFAnimationPathWeights;
+
+typedef NS_ENUM(NSInteger, GLTFMeshoptCompressionMode) {
+    GLTFMeshoptCompressionModeAttributes = 1,
+    GLTFMeshoptCompressionModeTriangles = 2,
+    GLTFMeshoptCompressionModeIndices = 3,
+};
+
+typedef NS_ENUM(NSInteger, GLTFMeshoptCompressionFilter) {
+    GLTFMeshoptCompressionFilterNone,
+    GLTFMeshoptCompressionFilterOctahedral,
+    GLTFMeshoptCompressionFilterQuaternion,
+    GLTFMeshoptCompressionFilterExponential,
+};
 
 extern float GLTFDegFromRad(float rad);
 extern int GLTFBytesPerComponentForComponentType(GLTFComponentType type);
@@ -165,7 +179,7 @@ GLTFKIT2_EXPORT
 @property (nonatomic, copy) NSArray<NSNumber *> *maxValues;
 @property (nonatomic, nullable, strong) GLTFSparseStorage *sparse;
 
-- (instancetype)initWithBufferView:(GLTFBufferView * _Nullable)bufferView
+- (instancetype)initWithBufferView:(nullable GLTFBufferView *)bufferView
                             offset:(NSInteger)offset
                      componentType:(GLTFComponentType)componentType
                          dimension:(GLTFValueDimension)dimension
@@ -175,6 +189,9 @@ GLTFKIT2_EXPORT
 - (instancetype)init NS_UNAVAILABLE;
 
 @end
+
+extern NSData *GLTFPackedDataForAccessor(GLTFAccessor * accessor);
+extern NSData *GLTFTransformPackedDataToFloat(NSData *sourceData, GLTFAccessor *sourceAccessor);
 
 @class GLTFAnimationChannel;
 @class GLTFAnimationSampler;
@@ -236,10 +253,33 @@ GLTFKIT2_EXPORT
 @property (nonatomic, nullable) NSData *data;
 @property (nonatomic, nullable) NSURL *uri;
 @property (nonatomic, assign) NSInteger length;
+// Introduced by the EXT_meshopt_compression extension
+@property (nonatomic, assign, getter=isMeshoptFallback) BOOL meshoptFallback;
 
 - (instancetype)initWithLength:(NSInteger)length NS_DESIGNATED_INITIALIZER;
 
 - (instancetype)initWithData:(NSData *)data NS_DESIGNATED_INITIALIZER;
+
+- (instancetype)init NS_UNAVAILABLE;
+
+@end
+
+GLTFKIT2_EXPORT
+@interface GLTFMeshoptCompression : GLTFObject
+
+@property (nonatomic, nullable) GLTFBuffer *buffer;
+@property (nonatomic, assign) NSInteger offset;
+@property (nonatomic, assign) NSUInteger length;
+@property (nonatomic, assign) NSUInteger stride;
+@property (nonatomic, assign) NSUInteger count;
+@property (nonatomic, assign) GLTFMeshoptCompressionMode mode;
+@property (nonatomic, assign) GLTFMeshoptCompressionFilter filter;
+
+- (instancetype)initWithBuffer:(GLTFBuffer *)buffer
+                        length:(NSUInteger)length
+                        stride:(NSUInteger)stride
+                         count:(NSUInteger)count
+                          mode:(GLTFMeshoptCompressionMode)mode NS_DESIGNATED_INITIALIZER;
 
 - (instancetype)init NS_UNAVAILABLE;
 
@@ -252,7 +292,8 @@ GLTFKIT2_EXPORT
 @property (nonatomic, assign) NSInteger offset;
 @property (nonatomic, assign) NSInteger length;
 @property (nonatomic, assign) NSInteger stride;
-//@property (nonatomic, assign) NSInteger target;
+// Introduced by the EXT_meshopt_compression extension
+@property (nonatomic, nullable, strong) GLTFMeshoptCompression *meshoptCompression;
 
 - (instancetype)initWithBuffer:(GLTFBuffer *)buffer
                         length:(NSInteger)length
@@ -309,7 +350,8 @@ GLTFKIT2_EXPORT
 - (instancetype)initWithCGImage:(CGImageRef)cgImage NS_DESIGNATED_INITIALIZER; // For internal use.
 - (instancetype)init NS_UNAVAILABLE;
 
-- (CGImageRef _Nullable)newCGImage;
+- (nullable CGImageRef)newCGImage;
+- (nullable id<MTLTexture>)newTextureWithDevice:(id<MTLDevice>)device;
 
 @end
 
@@ -425,6 +467,20 @@ GLTFKIT2_EXPORT
 @end
 
 GLTFKIT2_EXPORT
+@interface GLTFAnisotropyParams : NSObject
+
+/// The anisotropy strength. When `anisotropyTexture` is present, this value is multiplied by the blue channel.
+@property (nonatomic, assign) float strength;
+/// The rotation of the anisotropy in tangent, bitangent space, measured in radians counter-clockwise from the tangent.
+/// When `anisotropyTexture` is present, `rotation` provides additional rotation to the vectors in the texture.
+@property (nonatomic, assign) float rotation;
+/// The anisotropy texture. Red and green channels represent the anisotropy direction in [-1, 1] tangent, bitangent space,
+/// to be rotated by `rotation`. The blue channel contains strength as [0, 1] to be multiplied by `strength`.
+@property (nonatomic, nullable) GLTFTextureParams *anisotropyTexture;
+
+@end
+
+GLTFKIT2_EXPORT
 @interface GLTFMaterial : GLTFObject
 
 @property (nonatomic, nullable) GLTFPBRMetallicRoughnessParams *metallicRoughness;
@@ -436,9 +492,14 @@ GLTFKIT2_EXPORT
 @property (nonatomic, nullable) GLTFClearcoatParams *clearcoat;
 @property (nonatomic, nullable) GLTFSheenParams *sheen;
 @property (nonatomic, nullable) GLTFIridescence *iridescence;
+@property (nonatomic, nullable) GLTFAnisotropyParams *anisotropy;
 @property (nonatomic, nullable) GLTFTextureParams *normalTexture;
 @property (nonatomic, nullable) GLTFTextureParams *occlusionTexture;
 @property (nonatomic, nullable) NSNumber *indexOfRefraction;
+/// The strength of the dispersion effect, specified as 20 divided by the material's
+/// Abbe number. If nil or equal to 0, no disperson should be applied.
+/// Introduced by the KHR_materials_dispersion extension.
+@property (nonatomic, nullable) NSNumber *dispersion;
 @property (nonatomic, assign) GLTFAlphaMode alphaMode;
 @property (nonatomic, assign) float alphaCutoff;
 @property (nonatomic, assign, getter=isDoubleSided) BOOL doubleSided;
@@ -459,12 +520,29 @@ GLTFKIT2_EXPORT
 
 @end
 
-typedef NSDictionary<NSString *, GLTFAccessor *> GLTFMorphTarget;
+GLTFKIT2_EXPORT
+@interface GLTFAttribute : GLTFObject
+@property (nonatomic, strong) GLTFAccessor *accessor;
+
+- (instancetype)initWithName:(NSString *)name accessor:(GLTFAccessor *)accessor NS_DESIGNATED_INITIALIZER;
+
+- (instancetype)init NS_UNAVAILABLE;
+
+@end
+
+typedef NSArray<GLTFAttribute *> GLTFMorphTarget;
+
+GLTFKIT2_EXPORT
+@interface GLTFMeshInstances : GLTFObject
+@property (nonatomic, copy) NSArray<GLTFAttribute *> *attributes;
+@property (nonatomic, readonly) NSInteger instanceCount;
+- (simd_float4x4)transformAtIndex:(NSInteger)index;
+@end
 
 GLTFKIT2_EXPORT
 @interface GLTFPrimitive : GLTFObject
 
-@property (nonatomic, copy) NSDictionary<NSString *, GLTFAccessor *> *attributes;
+@property (nonatomic, copy) NSArray<GLTFAttribute *> *attributes;
 @property (nonatomic, nullable, strong) GLTFAccessor *indices;
 @property (nonatomic, nullable, strong) GLTFMaterial *material;
 @property (nonatomic, assign) GLTFPrimitiveType primitiveType;
@@ -472,13 +550,15 @@ GLTFKIT2_EXPORT
 @property (nonatomic, nullable, copy) NSArray<GLTFMaterialMapping *> *materialMappings;
 
 - (instancetype)initWithPrimitiveType:(GLTFPrimitiveType)primitiveType
-                           attributes:(NSDictionary<NSString *, GLTFAccessor *> *)attributes
-                              indices:(GLTFAccessor * _Nullable)indices NS_DESIGNATED_INITIALIZER;
+                           attributes:(NSArray<GLTFAttribute *> *)attributes
+                              indices:(nullable GLTFAccessor *)indices NS_DESIGNATED_INITIALIZER;
 
 - (instancetype)initWithPrimitiveType:(GLTFPrimitiveType)primitiveType
-                           attributes:(NSDictionary<NSString *, GLTFAccessor *> *)attributes;
+                           attributes:(NSArray<GLTFAttribute *> *)attributes;
 
 - (instancetype)init NS_UNAVAILABLE;
+
+- (nullable GLTFAttribute *)attributeForName:(NSString *)name;
 
 - (GLTFMaterial *)effectiveMaterialForVariant:(GLTFMaterialVariant *)variant;
 
@@ -498,6 +578,7 @@ GLTFKIT2_EXPORT
 @property (nonatomic, assign) simd_float3 scale;
 @property (nonatomic, assign) simd_float3 translation;
 @property (nonatomic, nullable, copy) NSArray<NSNumber *> *weights;
+@property (nonatomic, nullable, strong) GLTFMeshInstances *meshInstances;
 
 @end
 
@@ -580,8 +661,10 @@ GLTFKIT2_EXPORT
 
 @property (nonatomic, nullable, strong) GLTFTextureSampler *sampler;
 @property (nonatomic, nullable, strong) GLTFImage *source;
+@property (nonatomic, nullable, strong) GLTFImage *basisUSource;
 
-- (instancetype)initWithSource:(GLTFImage * _Nullable)source NS_DESIGNATED_INITIALIZER;
+- (instancetype)initWithSource:(nullable GLTFImage *)source;
+- (instancetype)initWithSource:(nullable GLTFImage *)source basisUSource:(nullable GLTFImage *)basisUSource NS_DESIGNATED_INITIALIZER;
 
 @end
 

@@ -1,7 +1,18 @@
 
 #import "GLTFAsset.h"
 #import "GLTFAssetReader.h"
+#import "GLTFLogging.h"
+#import "GLTFKTX2Support.h"
+
 #import <ImageIO/ImageIO.h>
+
+#if TARGET_OS_IPHONE
+#import <MobileCoreServices/MobileCoreServices.h>
+#endif
+
+#if __has_include(<UniformTypeIdentifiers/UniformTypeIdentifiers.h>)
+    #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#endif
 
 NSString *const GLTFErrorDomain = @"com.metalbyexample.gltfkit2";
 
@@ -33,6 +44,8 @@ GLTFAnimationPath GLTFAnimationPathTranslation = @"translation";
 GLTFAnimationPath GLTFAnimationPathRotation = @"rotation";
 GLTFAnimationPath GLTFAnimationPathScale = @"scale";
 GLTFAnimationPath GLTFAnimationPathWeights = @"weights";
+
+static NSString *const GLTFMediaTypeWebP = @"image/webp";
 
 float GLTFDegFromRad(float rad) {
     return rad * (180.0 / M_PI);
@@ -76,7 +89,208 @@ int GLTFComponentCountForDimension(GLTFValueDimension dim) {
     return 0;
 }
 
-NSData *GLTFCreateImageDataFromDataURI(NSString *uriData) {
+NSData *GLTFPackedDataForAccessor(GLTFAccessor *accessor) {
+    GLTFBufferView *bufferView = accessor.bufferView;
+    GLTFBuffer *buffer = bufferView.buffer;
+    size_t bytesPerComponent = GLTFBytesPerComponentForComponentType(accessor.componentType);
+    size_t componentCount = GLTFComponentCountForDimension(accessor.dimension);
+    size_t elementSize = bytesPerComponent * componentCount;
+    size_t bufferLength = elementSize * accessor.count;
+    void *bytes = malloc(bufferLength);
+    if (bufferView != nil) {
+        void *bufferViewBaseAddr = (void *)buffer.data.bytes + bufferView.offset;
+        if (bufferView.stride == 0 || bufferView.stride == elementSize) {
+            // Fast path
+            memcpy(bytes, bufferViewBaseAddr + accessor.offset, accessor.count * elementSize);
+        } else {
+            // Slow path, element by element
+            size_t sourceStride = bufferView.stride ?: elementSize;
+            for (int i = 0; i < accessor.count; ++i) {
+                void *src = bufferViewBaseAddr + (i * sourceStride) + accessor.offset;
+                void *dest = bytes + (i * elementSize);
+                memcpy(dest, src, elementSize);
+            }
+        }
+    } else {
+        // 3.6.2.3. Sparse Accessors
+        // When accessor.bufferView is undefined, the sparse accessor is initialized as
+        // an array of zeros of size (size of the accessor element) * (accessor.count) bytes.
+        // https://www.khronos.org/registry/glTF/specs/2.0/glTF-2.0.html#sparse-accessors
+        memset(bytes, 0, bufferLength);
+    }
+    if (accessor.sparse) {
+        const void *baseSparseIndexBufferViewPtr = accessor.sparse.indices.buffer.data.bytes +
+                                                   accessor.sparse.indices.offset;
+        const void *baseSparseIndexAccessorPtr = baseSparseIndexBufferViewPtr + accessor.sparse.indexOffset;
+
+        const void *baseValueBufferViewPtr = accessor.sparse.values.buffer.data.bytes + accessor.sparse.values.offset;
+        const void *baseSrcPtr = baseValueBufferViewPtr + accessor.sparse.valueOffset;
+        const size_t srcValueStride = accessor.sparse.values.stride ?: elementSize;
+
+        void *baseDestPtr = bytes;
+
+        switch (accessor.sparse.indexComponentType) {
+            case GLTFComponentTypeUnsignedByte: {
+                const UInt8 *sparseIndices = (UInt8 *)baseSparseIndexAccessorPtr;
+                for (int i = 0; i < accessor.sparse.count; ++i) {
+                    UInt8 sparseIndex = sparseIndices[i];
+                    memcpy(baseDestPtr + sparseIndex * elementSize, baseSrcPtr + (i * srcValueStride), elementSize);
+                }
+                break;
+            }
+            case GLTFComponentTypeUnsignedShort: {
+                const UInt16 *sparseIndices = (UInt16 *)baseSparseIndexAccessorPtr;
+                for (int i = 0; i < accessor.sparse.count; ++i) {
+                    UInt16 sparseIndex = sparseIndices[i];
+                    memcpy(baseDestPtr + sparseIndex * elementSize, baseSrcPtr + (i * srcValueStride), elementSize);
+                }
+                break;
+            }
+            case GLTFComponentTypeUnsignedInt: {
+                const UInt32 *sparseIndices = (UInt32 *)baseSparseIndexAccessorPtr;
+                for (int i = 0; i < accessor.sparse.count; ++i) {
+                    UInt32 sparseIndex = sparseIndices[i];
+                    memcpy(baseDestPtr + sparseIndex * elementSize, baseSrcPtr + (i * srcValueStride), elementSize);
+                }
+                break;
+            }
+            default:
+                assert(!"Sparse accessor index type must be one of: unsigned byte, unsigned short, or unsigned int.");
+                break;
+        }
+    }
+    return [NSData dataWithBytesNoCopy:bytes length:bufferLength freeWhenDone:YES];
+}
+
+NSData *GLTFTransformPackedDataToFloat(NSData *sourceData, GLTFAccessor *sourceAccessor) {
+    if (sourceAccessor.componentType == GLTFComponentTypeFloat) {
+        return sourceData; // Nothing to do
+    }
+
+    if ((sourceAccessor.componentType != GLTFComponentTypeByte) &&
+        (sourceAccessor.componentType != GLTFComponentTypeUnsignedByte) &&
+        (sourceAccessor.componentType != GLTFComponentTypeShort) &&
+        (sourceAccessor.componentType != GLTFComponentTypeUnsignedShort))
+    {
+        NSLog(@"[GLTFKit2] Warning: Failed to convert unsupported normalized data. Returning source data.");
+        return sourceData;
+    }
+
+    size_t vectorCount = sourceAccessor.count;
+    size_t componentCount = sourceAccessor.dimension;
+    size_t elementCount = vectorCount * componentCount;
+
+    size_t outBufferSize = vectorCount * componentCount * sizeof(float);
+    float *dstBase = malloc(outBufferSize);
+    NSData *outData = [NSData dataWithBytesNoCopy:dstBase length:outBufferSize freeWhenDone:YES];
+
+    // "Implementations MUST use following equations to decode real floating-point value f from a normalized integer c"
+    // https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#animations
+    switch (sourceAccessor.componentType) {
+        case GLTFComponentTypeByte: {
+            const int8_t *srcBase = sourceData.bytes;
+            if (sourceAccessor.isNormalized) {
+                for (size_t i = 0; i < elementCount; ++i) {
+                    dstBase[i] = MAX(srcBase[i] / 127.0f, -1.0f); // max(c / 127.0, -1.0)
+                }
+            } else {
+                for (size_t i = 0; i < elementCount; ++i) {
+                    dstBase[i] = srcBase[i];
+                }
+            }
+            break;
+        }
+        case GLTFComponentTypeUnsignedByte: {
+            const uint8_t *srcBase = sourceData.bytes;
+            if (sourceAccessor.isNormalized) {
+                for (size_t i = 0; i < elementCount; ++i) {
+                    dstBase[i] = srcBase[i] / 255.0f; // f = c / 255.0
+                }
+            } else {
+                for (size_t i = 0; i < elementCount; ++i) {
+                    dstBase[i] = srcBase[i];
+                }
+            }
+            break;
+        }
+        case GLTFComponentTypeShort: {
+            const int16_t *srcBase = sourceData.bytes;
+            if (sourceAccessor.isNormalized) {
+                for (size_t i = 0; i < elementCount; ++i) {
+                    dstBase[i] = MAX(srcBase[i] / 32767.0f, -1.0f); // f = max(c / 32767.0, -1.0)
+                }
+            } else {
+                for (size_t i = 0; i < elementCount; ++i) {
+                    dstBase[i] = srcBase[i];
+                }
+            }
+            break;
+        }
+        case GLTFComponentTypeUnsignedShort: {
+            const uint16_t *srcBase = sourceData.bytes;
+            if (sourceAccessor.isNormalized) {
+                for (size_t i = 0; i < elementCount; ++i) {
+                    dstBase[i] = srcBase[i] / 65535.0f; // f = c / 65535.0
+                }
+            } else {
+                for (size_t i = 0; i < elementCount; ++i) {
+                    dstBase[i] = srcBase[i];
+                }
+            }
+            break;
+        }
+        default:
+            break; // Impossible.
+    }
+
+    return outData;
+}
+
+static NSString * _Nullable GLTFInferredMediaTypeForData(NSData *data) {
+    const uint8_t *bytes = (const uint8_t *)data.bytes;
+
+    uint8_t pngIdentifier[] = { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+    if (data.length > 8 && (memcmp(bytes, pngIdentifier, 8) == 0)) {
+        return @"image/png";
+    }
+    uint8_t jpegIdentifier[] = { 0xFF, 0xD8, 0xFF };
+    if (data.length > 3 && (memcmp(bytes, jpegIdentifier, 3) == 0)) {
+        return @"image/jpeg";
+    }
+    uint8_t ktx2Identifier[] = { 0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A };
+    if (data.length > 12 && (memcmp(bytes, ktx2Identifier, 12) == 0)) {
+        return GLTFMediaTypeKTX2;
+    }
+    uint8_t riffIdentifier[] = { 0x52, 0x49, 0x46, 0x46 };
+    uint8_t webpIdentifier[] = { 0x57, 0x45, 0x42, 0x50 };
+    if (data.length > 12 && (memcmp(bytes, riffIdentifier, 4) == 0) && (memcmp(bytes + 8, webpIdentifier, 4) == 0)) {
+        return GLTFMediaTypeWebP;
+    }
+
+    return nil;
+}
+
+static NSString *_Nullable GLTFCreateUTIForMediaType(NSString *mediaType) {
+    // Despite a UTI for KTX2 existing in the system, it's not possible to create it from a file extension
+    // or MIME type as of macOS 14.0, even using the newer UTType APIs, so we hack around that here.
+    if ([mediaType isEqualToString:GLTFMediaTypeKTX2]) {
+        return @"org.khronos.ktx2";
+    }
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+    UTType *_Nullable type = [UTType typeWithMIMEType:mediaType];
+    return type.identifier;
+#else
+    if (@available(macos 11.0, iOS 14.0, tvOS 14.0, *)) {
+        UTType *_Nullable type = [UTType typeWithMIMEType:mediaType];
+        return type.identifier;
+    } else {
+        CFStringRef uti = UTTypeCreatePreferredIdentifierForTag(kUTTagClassMIMEType, (__bridge CFStringRef)mediaType, NULL);
+        return (__bridge_transfer NSString *)uti;
+    }
+#endif
+}
+
+NSData *GLTFCreateImageDataFromDataURI(NSString *uriData, NSString **outMediaType) {
     NSString *prefix = @"data:";
     if ([uriData hasPrefix:prefix]) {
         NSInteger prefixEnd = prefix.length;
@@ -85,6 +299,9 @@ NSData *GLTFCreateImageDataFromDataURI(NSString *uriData) {
             NSString *mediaTypeAndTokenString = [uriData substringWithRange:NSMakeRange(prefixEnd, firstComma - prefixEnd)];
             NSArray *mediaTypeAndToken = [mediaTypeAndTokenString componentsSeparatedByString:@";"];
             if (mediaTypeAndToken.count > 0) {
+                if (outMediaType) {
+                    *outMediaType = mediaTypeAndToken[0];
+                }
                 NSString *encodedImageData = [uriData substringFromIndex:firstComma + 1];
                 NSData *imageData = [[NSData alloc] initWithBase64EncodedString:encodedImageData
                                                                         options:NSDataBase64DecodingIgnoreUnknownCharacters];
@@ -142,7 +359,7 @@ NSData *GLTFCreateImageDataFromDataURI(NSString *uriData) {
 {
     __block NSError *internalError = nil;
     __block GLTFAsset *maybeAsset = nil;
-    dispatch_semaphore_t loadSemaphore = dispatch_semaphore_create(1);
+    dispatch_semaphore_t loadSemaphore = dispatch_semaphore_create(0);
     [self loadAssetWithData:data options:options handler:^(float progress,
                                                          GLTFAssetStatus status,
                                                          GLTFAsset *asset,
@@ -210,7 +427,7 @@ NSData *GLTFCreateImageDataFromDataURI(NSString *uriData) {
 
 @implementation GLTFAccessor
 
-- (instancetype)initWithBufferView:(GLTFBufferView * _Nullable)bufferView
+- (instancetype)initWithBufferView:(nullable GLTFBufferView *)bufferView
                             offset:(NSInteger)offset
                      componentType:(GLTFComponentType)componentType
                          dimension:(GLTFValueDimension)dimension
@@ -303,6 +520,26 @@ NSData *GLTFCreateImageDataFromDataURI(NSString *uriData) {
 
 @end
 
+@implementation GLTFMeshoptCompression
+
+- (instancetype)initWithBuffer:(GLTFBuffer *)buffer
+                        length:(NSUInteger)length
+                        stride:(NSUInteger)stride
+                         count:(NSUInteger)count
+                          mode:(GLTFMeshoptCompressionMode)mode
+{
+    if (self = [super init]) {
+        _buffer = buffer;
+        _length = length;
+        _stride = stride;
+        _count = count;
+        _mode = mode;
+    }
+    return self;
+}
+
+@end
+
 @implementation GLTFBufferView
 
 - (instancetype)initWithBuffer:(GLTFBuffer *)buffer
@@ -369,6 +606,7 @@ NSData *GLTFCreateImageDataFromDataURI(NSString *uriData) {
 
 @interface GLTFImage ()
 @property (nonatomic, nullable) CGImageRef cachedImage;
+@property (nonatomic, nullable) id<MTLTexture> cachedTexture;
 @end
 
 @implementation GLTFImage
@@ -399,44 +637,86 @@ NSData *GLTFCreateImageDataFromDataURI(NSString *uriData) {
     CGImageRelease(_cachedImage);
 }
 
-- (CGImageRef)newCGImage {
-    if (self.cachedImage) {
-        return CGImageRetain(_cachedImage);
-    }
+- (nullable NSData *)newImageDataReturningInferredMediaType:(NSString **)outMediaType {
     BOOL isAccessingSecurityScoped = NO;
-    CGImageRef image = NULL;
-    CGImageSourceRef imageSource = NULL;
+    __block NSData *data = nil;
+    NSString *mediaType = nil;
     if (self.bufferView) {
         NSData *imageData = self.bufferView.buffer.data;
         const UInt8 *imageBytes = imageData.bytes + self.bufferView.offset;
         CFDataRef sourceData = CFDataCreate(NULL, imageBytes, self.bufferView.length);
-        imageSource = CGImageSourceCreateWithData(sourceData, NULL);
-        CFRelease(sourceData);
+        data = (__bridge_transfer NSData *)sourceData;
     } else if (self.uri) {
         if ([self.uri.scheme isEqual:@"data"]) {
-            NSData *imageData = GLTFCreateImageDataFromDataURI(self.uri.absoluteString);
-            imageSource = CGImageSourceCreateWithData((__bridge CFDataRef)imageData, NULL);
+            data = GLTFCreateImageDataFromDataURI(self.uri.absoluteString, &mediaType);
         } else {
             isAccessingSecurityScoped = [self.assetDirectoryURL startAccessingSecurityScopedResource];
-            __block NSData *imageData = nil;
             NSError *coordinationError = nil;
             NSFileCoordinator *coordinator = [[NSFileCoordinator alloc] init];
             [coordinator coordinateReadingItemAtURL:_uri options:0 error:&coordinationError byAccessor:^(NSURL *newURL) {
-                imageData = [NSData dataWithContentsOfURL:newURL];
+                data = [NSData dataWithContentsOfURL:newURL];
             }];
-            if (imageData) {
-                imageSource = CGImageSourceCreateWithData((__bridge CFDataRef)imageData, NULL);
-            }
         }
-    }
-    if (imageSource) {
-        image = CGImageSourceCreateImageAtIndex(imageSource, 0, NULL);
-        CFRelease(imageSource);
     }
     if (isAccessingSecurityScoped) {
         [self.assetDirectoryURL stopAccessingSecurityScopedResource];
     }
+    if (data) {
+        if (mediaType == nil) {
+            mediaType = GLTFInferredMediaTypeForData(data);
+        }
+        if (outMediaType) {
+            *outMediaType = mediaType;
+        }
+    }
+    return data;
+}
+
+- (nullable CGImageRef)newCGImage {
+    if (self.cachedImage) {
+        return CGImageRetain(_cachedImage);
+    }
+
+    NSString *maybeMediaType = nil;
+    NSData *imageData = [self newImageDataReturningInferredMediaType:&maybeMediaType];
+    CGImageRef image = NULL;
+    if (imageData) {
+        if (maybeMediaType) {
+            NSString *uti = GLTFCreateUTIForMediaType(maybeMediaType);
+            NSArray *supportedUTIs = (__bridge NSArray *)CGImageSourceCopyTypeIdentifiers();
+            // Check for support for this image type. Note that image loading can still fail if, for example,
+            // the image file is a KTX2 container with an unsupported supercompression scheme like BasisU.
+            if (![supportedUTIs containsObject:uti]) {
+                GLTFLogWarning(@"[GLTFKit2] Unrecognized type identifier for image media type %@", maybeMediaType);
+            }
+        }
+        CGImageSourceRef imageSource = CGImageSourceCreateWithData((__bridge CFDataRef)imageData, NULL);
+        if (imageSource) {
+            image = CGImageSourceCreateImageAtIndex(imageSource, 0, NULL);
+            CFRelease(imageSource);
+        }
+    }
     return image;
+}
+
+- (nullable id<MTLTexture>)newTextureWithDevice:(id<MTLDevice>)device {
+    if (self.cachedTexture) {
+        return self.cachedTexture;
+    }
+
+#ifdef GLTF_BUILD_WITH_KTX2
+    NSString *maybeMediaType = nil;
+    NSData *imageData = [self newImageDataReturningInferredMediaType:&maybeMediaType];
+
+    if (imageData && [maybeMediaType isEqualToString:GLTFMediaTypeKTX2]) {
+        id<MTLTexture> texture = GLTFCreateTextureFromKTX2Data(imageData, device);
+        return texture;
+    }
+#else
+    GLTFLogError(@"[GLTFKit2] Texture was requested from a GLTFImage, but GLTFKit2 was compiled without KTX2 support");
+#endif
+    
+    return nil;
 }
 
 @end
@@ -556,6 +836,18 @@ NSData *GLTFCreateImageDataFromDataURI(NSString *uriData) {
 
 @end
 
+@implementation GLTFAnisotropyParams : NSObject
+
+- (instancetype)init {
+    if (self = [super init]) {
+        _strength = 0.0f;
+        _rotation = 0.0f;
+    }
+    return self;
+}
+
+@end
+
 @implementation GLTFMaterial
 
 - (instancetype)init {
@@ -584,6 +876,103 @@ NSData *GLTFCreateImageDataFromDataURI(NSString *uriData) {
 
 @end
 
+@implementation GLTFAttribute
+
+- (instancetype)initWithName:(NSString *)name accessor:(GLTFAccessor *)accessor {
+    if (self = [super init]) {
+        [super setName:name];
+        _accessor = accessor;
+    }
+    return self;
+}
+
+@end
+
+@interface GLTFMeshInstances ()
+@property (nonatomic, nullable, strong) NSData *cachedTransforms;
+@end
+
+@implementation GLTFMeshInstances
+
+- (NSInteger)instanceCount {
+    return self.attributes.firstObject.accessor.count;
+}
+
+- (nullable GLTFAttribute *)attributeForName:(NSString *)name {
+    for (GLTFAttribute *attrib in self.attributes) {
+        if ([attrib.name isEqualToString:name]) {
+            return attrib;
+        }
+    }
+    return nil;
+}
+
+- (simd_float4x4)transformAtIndex:(NSInteger)index {
+    if (_cachedTransforms == nil) {
+        NSData *_Nullable translationData = nil;
+        NSData *_Nullable rotationData = nil;
+        NSData *_Nullable scaleData = nil;
+        simd_float4x4 *transforms = NULL;
+        size_t transformDataLength = sizeof(simd_float4x4) * self.instanceCount;
+        posix_memalign((void **)&transforms, _Alignof(simd_float4x4), transformDataLength);
+        GLTFAttribute *_Nullable translationAttr = [self attributeForName:@"TRANSLATION"];
+        if (translationAttr && translationAttr.accessor) {
+            GLTFAccessor *translationAccessor = translationAttr.accessor;
+            if (translationAccessor.componentType == GLTFComponentTypeFloat && 
+                translationAccessor.dimension == GLTFValueDimensionVector3)
+            {
+                translationData = GLTFPackedDataForAccessor(translationAccessor);
+            } else {
+                GLTFLogWarning(@"Translation attribute was present on mesh instancing object, but was not of float VEC3 type");
+            }
+        }
+        GLTFAttribute *_Nullable rotationAttr = [self attributeForName:@"ROTATION"];
+        if (rotationAttr && rotationAttr.accessor) {
+            GLTFAccessor *rotationAccessor = rotationAttr.accessor;
+            NSData *packedRotationData = GLTFPackedDataForAccessor(rotationAccessor);
+            rotationData = GLTFTransformPackedDataToFloat(packedRotationData, rotationAccessor);
+        }
+        GLTFAttribute *_Nullable scaleAttr = [self attributeForName:@"SCALE"];
+        if (scaleAttr && scaleAttr.accessor) {
+            GLTFAccessor *scaleAccessor = scaleAttr.accessor;
+            if (scaleAccessor.componentType == GLTFComponentTypeFloat && 
+                scaleAccessor.dimension == GLTFValueDimensionVector3)
+            {
+                scaleData = GLTFPackedDataForAccessor(scaleAccessor);
+            } else {
+                GLTFLogWarning(@"Scale attribute was present on mesh instancing object, but was not of float VEC3 type");
+            }
+        }
+        for (int i = 0; i < self.instanceCount; ++i) {
+            simd_float4x4 M = matrix_identity_float4x4;
+            if (scaleData) {
+                float *scale = ((float *)scaleData.bytes) + (i * 3);
+                M.columns[0][0] = scale[0];
+                M.columns[1][1] = scale[1];
+                M.columns[2][2] = scale[2];
+            }
+            if (rotationData) {
+                simd_quatf rotation;
+                memcpy(&rotation, ((float *)rotationData.bytes) + (i * 4), sizeof(float) * 4);
+                M = simd_mul(simd_matrix4x4(rotation), M);
+            }
+            if (translationData) {
+                float *trans = ((float *)translationData.bytes) + (i * 3);
+                M.columns[3][0] = trans[0];
+                M.columns[3][1] = trans[1];
+                M.columns[3][2] = trans[2];
+            }
+            transforms[i] = M;
+        }
+        _cachedTransforms = [NSData dataWithBytesNoCopy:transforms length:transformDataLength freeWhenDone:YES];
+    }
+    NSAssert(index >= 0 && index < self.instanceCount, @"Could not access instance transform at index %d (of %d)",
+             (int)index, (int)self.instanceCount);
+    return ((simd_float4x4 *)self.cachedTransforms.bytes)[index];
+}
+
+@end
+
 @interface GLTFPrimitive ()
 @property (nonatomic, weak) GLTFMaterialMapping *cachedMapping;
 @end
@@ -591,13 +980,13 @@ NSData *GLTFCreateImageDataFromDataURI(NSString *uriData) {
 @implementation GLTFPrimitive
 
 - (instancetype)initWithPrimitiveType:(GLTFPrimitiveType)primitiveType
-                           attributes:(NSDictionary<NSString *, GLTFAccessor *> *)attributes
+                           attributes:(NSArray<GLTFAttribute *> *)attributes
 {
     return [self initWithPrimitiveType:primitiveType attributes:attributes indices:nil];
 }
 
 - (instancetype)initWithPrimitiveType:(GLTFPrimitiveType)primitiveType
-                           attributes:(NSDictionary<NSString *, GLTFAccessor *> *)attributes
+                           attributes:(NSArray<GLTFAttribute *> *)attributes
                               indices:(GLTFAccessor *)indices
 {
     if (self = [super init]) {
@@ -606,6 +995,15 @@ NSData *GLTFCreateImageDataFromDataURI(NSString *uriData) {
         _indices = indices;
     }
     return self;
+}
+
+- (nullable GLTFAttribute *)attributeForName:(NSString *)name {
+    for (GLTFAttribute *attrib in self.attributes) {
+        if ([attrib.name isEqualToString:name]) {
+            return attrib;
+        }
+    }
+    return nil;
 }
 
 - (GLTFMaterial *)effectiveMaterialForVariant:(GLTFMaterialVariant *)variant {
@@ -750,11 +1148,16 @@ NSData *GLTFCreateImageDataFromDataURI(NSString *uriData) {
 
 @implementation GLTFTexture
 
-- (instancetype)initWithSource:(GLTFImage *)source {
+- (instancetype)initWithSource:(nullable GLTFImage *)source basisUSource:(GLTFImage *)basisUSource {
     if (self = [super init]) {
         _source = source;
+        _basisUSource = basisUSource;
     }
     return self;
+}
+
+- (instancetype)initWithSource:(nullable GLTFImage *)source {
+    return [self initWithSource:source basisUSource:nil];
 }
 
 - (instancetype)init {

@@ -10,15 +10,12 @@ class ViewController: NSViewController {
                 let source = GLTFSCNSceneSource(asset: asset)
                 sceneView.scene = source.defaultScene
                 animations = source.animations
-                if let defaultAnimation = animations.first {
-                    sceneView.scene?.rootNode.addAnimationPlayer(defaultAnimation.animationPlayer, forKey: nil)
-                }
                 sceneView.scene?.lightingEnvironment.contents = "studio.hdr"
                 sceneView.scene?.lightingEnvironment.intensity = 1.0
 
                 let sunLight = SCNLight()
                 sunLight.type = .directional
-                sunLight.intensity = 800
+                sunLight.intensity = 600
                 sunLight.color = NSColor.white
                 sunLight.castsShadow = true
                 let sun = SCNNode()
@@ -28,7 +25,7 @@ class ViewController: NSViewController {
 
                 let moonLight = SCNLight()
                 moonLight.type = .directional
-                moonLight.intensity = 200
+                moonLight.intensity = 100
                 moonLight.color = NSColor.white
                 let moon = SCNNode()
                 moon.light = moonLight
@@ -37,7 +34,7 @@ class ViewController: NSViewController {
 
                 let cameraLight = SCNLight()
                 cameraLight.type = .directional
-                cameraLight.intensity = 500
+                cameraLight.intensity = 300
                 cameraLight.color = NSColor.white
                 sceneView.pointOfView?.light = cameraLight
 

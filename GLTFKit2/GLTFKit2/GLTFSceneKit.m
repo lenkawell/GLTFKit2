@@ -169,6 +169,9 @@ static SCNGeometryElement *GLTFSCNGeometryElementForIndexData(NSData *indexData,
     SCNGeometryPrimitiveType primitiveType;
     int primitiveCount;
     switch (primitive.primitiveType) {
+        case GLTFPrimitiveTypeInvalid:
+            GLTFLogError(@"Encountered primitive with invalid type. Will not create geometry element");
+            return nil;
         case GLTFPrimitiveTypePoints:
             primitiveType = SCNGeometryPrimitiveTypePoint;
             primitiveCount = indexCount;
@@ -219,10 +222,16 @@ static SCNGeometryElement *GLTFSCNGeometryElementForIndexData(NSData *indexData,
         finalIndexData = [NSData dataWithBytesNoCopy:indexStorage length:indexBufferLength freeWhenDone:YES];
     }
 
-    return [SCNGeometryElement geometryElementWithData:finalIndexData
-                                         primitiveType:primitiveType
-                                        primitiveCount:primitiveCount
-                                         bytesPerIndex:bytesPerIndex];
+    SCNGeometryElement *element = [SCNGeometryElement geometryElementWithData:finalIndexData
+                                                                primitiveType:primitiveType
+                                                               primitiveCount:primitiveCount
+                                                                bytesPerIndex:bytesPerIndex];
+    if (primitiveType == SCNGeometryPrimitiveTypePoint) {
+        // 3.9.7. Point and Line Materials: "Points and Lines SHOULD have widths of 1px in viewport space."
+        element.minimumPointScreenSpaceRadius = 1.0;
+        element.maximumPointScreenSpaceRadius = 1.0;
+    }
+    return element;
 }
 
 static NSString *GLTFSCNGeometrySourceSemanticForSemantic(NSString *name) {
@@ -242,6 +251,26 @@ static NSString *GLTFSCNGeometrySourceSemanticForSemantic(NSString *name) {
         return SCNGeometrySourceSemanticBoneWeights;
     }
     return name;
+}
+
+static NSString *GLTFAttributeNameForSCNGeometrySourceSemantic(SCNGeometrySourceSemantic semantic, int channel) {
+    if ([semantic isEqualToString:SCNGeometrySourceSemanticVertex]) {
+        return GLTFAttributeSemanticPosition;
+    } else if ([semantic isEqualToString:SCNGeometrySourceSemanticNormal]) {
+        return GLTFAttributeSemanticNormal;
+    } else if ([semantic isEqualToString:SCNGeometrySourceSemanticTangent]) {
+        return GLTFAttributeSemanticTangent;
+    } else if ([semantic isEqualToString:SCNGeometrySourceSemanticTexcoord]) {
+        return [NSString stringWithFormat:@"TEXCOORD_%d", channel];
+    } else if ([semantic isEqualToString:SCNGeometrySourceSemanticColor]) {
+        return [NSString stringWithFormat:@"COLOR_%d", channel];
+    } else if ([semantic isEqualToString:SCNGeometrySourceSemanticBoneIndices]) {
+        return [NSString stringWithFormat:@"JOINTS_%d", channel];
+    } else if ([semantic isEqualToString:SCNGeometrySourceSemanticBoneWeights]) {
+        return [NSString stringWithFormat:@"WEIGHTS_%d", channel];
+    }
+    // We can't meaningfully map SCNGeometrySourceSemanticVertexCrease or SCNGeometrySourceSemanticEdgeCrease
+    return semantic;
 }
 
 static void GLTFConfigureSCNMaterialProperty(SCNMaterialProperty *property, GLTFTextureParams *textureParams) {
@@ -281,92 +310,60 @@ static NSData *GLTFPackedUInt16DataFromPackedUInt8(UInt8 *bytes, size_t count) {
     return [NSData dataWithBytesNoCopy:shorts length:bufferSize freeWhenDone:YES];
 }
 
-static NSData *GLTFSCNPackedDataForAccessor(GLTFAccessor *accessor) {
-    GLTFBufferView *bufferView = accessor.bufferView;
-    GLTFBuffer *buffer = bufferView.buffer;
-    size_t bytesPerComponent = GLTFBytesPerComponentForComponentType(accessor.componentType);
-    size_t componentCount = GLTFComponentCountForDimension(accessor.dimension);
-    size_t elementSize = bytesPerComponent * componentCount;
-    size_t bufferLength = elementSize * accessor.count;
-    void *bytes = malloc(bufferLength);
-    if (bufferView != nil) {
-        void *bufferViewBaseAddr = (void *)buffer.data.bytes + bufferView.offset;
-        if (bufferView.stride == 0 || bufferView.stride == elementSize) {
-            // Fast path
-            memcpy(bytes, bufferViewBaseAddr + accessor.offset, accessor.count * elementSize);
-        } else {
-            // Slow path, element by element
-            size_t sourceStride = bufferView.stride ?: elementSize;
-            for (int i = 0; i < accessor.count; ++i) {
-                void *src = bufferViewBaseAddr + (i * sourceStride) + accessor.offset;
-                void *dest = bytes + (i * elementSize);
-                memcpy(dest, src, elementSize);
-            }
-        }
-    } else {
-        // 3.6.2.3. Sparse Accessors
-        // When accessor.bufferView is undefined, the sparse accessor is initialized as
-        // an array of zeros of size (size of the accessor element) * (accessor.count) bytes.
-        // https://www.khronos.org/registry/glTF/specs/2.0/glTF-2.0.html#sparse-accessors
-        memset(bytes, 0, bufferLength);
-    }
-    if (accessor.sparse) {
-        assert(accessor.sparse.indexComponentType == GLTFComponentTypeUnsignedShort ||
-               accessor.sparse.indexComponentType == GLTFComponentTypeUnsignedInt);
-        const void *baseSparseIndexBufferViewPtr = accessor.sparse.indices.buffer.data.bytes +
-                                                   accessor.sparse.indices.offset;
-        const void *baseSparseIndexAccessorPtr = baseSparseIndexBufferViewPtr + accessor.sparse.indexOffset;
-
-        const void *baseValueBufferViewPtr = accessor.sparse.values.buffer.data.bytes + accessor.sparse.values.offset;
-        const void *baseSrcPtr = baseValueBufferViewPtr + accessor.sparse.valueOffset;
-        const size_t srcValueStride = accessor.sparse.values.stride ?: elementSize;
-
-        void *baseDestPtr = bytes;
-
-        if (accessor.sparse.indexComponentType == GLTFComponentTypeUnsignedShort) {
-            const UInt16 *sparseIndices = (UInt16 *)baseSparseIndexAccessorPtr;
-            for (int i = 0; i < accessor.sparse.count; ++i) {
-                UInt16 sparseIndex = sparseIndices[i];
-                memcpy(baseDestPtr + sparseIndex * elementSize, baseSrcPtr + (i * srcValueStride), elementSize);
-            }
-        } else if (accessor.sparse.indexComponentType == GLTFComponentTypeUnsignedInt) {
-            const UInt32 *sparseIndices = (UInt32 *)baseSparseIndexAccessorPtr;
-            for (int i = 0; i < accessor.sparse.count; ++i) {
-                UInt32 sparseIndex = sparseIndices[i];
-                memcpy(baseDestPtr + sparseIndex * elementSize, baseSrcPtr + (i * srcValueStride), elementSize);
-            }
-        }
-    }
-    return [NSData dataWithBytesNoCopy:bytes length:bufferLength freeWhenDone:YES];
-}
-
 static NSArray<NSNumber *> *GLTFKeyTimeArrayForAccessor(GLTFAccessor *accessor, NSTimeInterval maxKeyTime) {
-    // TODO: This is actually not assured by the spec. We should convert from normalized int types when necessary
-    assert(accessor.componentType == GLTFComponentTypeFloat);
-    assert(accessor.dimension == GLTFValueDimensionScalar);
+    NSData *sourceData = GLTFPackedDataForAccessor(accessor);
+    sourceData = GLTFTransformPackedDataToFloat(sourceData, accessor);
     NSMutableArray *values = [NSMutableArray arrayWithCapacity:accessor.count];
-    const void *bufferViewBaseAddr = accessor.bufferView.buffer.data.bytes + accessor.bufferView.offset;
     float scale = (maxKeyTime > 0) ? (1.0f / maxKeyTime) : 1.0f;
     for (int i = 0; i < accessor.count; ++i) {
-        const float *x = bufferViewBaseAddr + (i * (accessor.bufferView.stride ?: sizeof(float))) + accessor.offset;
+        const float *x = sourceData.bytes + (i * sizeof(float));
         NSNumber *value = @(x[0] * scale);
         [values addObject:value];
     }
     return values;
 }
 
+static BOOL GLTFSCNNativelySupportsAccessor(GLTFAccessor *accessor, NSString *semanticName) {
+    if ([semanticName isEqualToString:GLTFAttributeSemanticPosition]) {
+        return (accessor.componentType == GLTFComponentTypeFloat) && (accessor.dimension == GLTFValueDimensionVector3);
+    } else if ([semanticName isEqualToString:GLTFAttributeSemanticNormal]) {
+        return (accessor.componentType == GLTFComponentTypeFloat) && (accessor.dimension == GLTFValueDimensionVector3);
+    }  else if ([semanticName isEqualToString:GLTFAttributeSemanticTangent]) {
+        return (accessor.componentType == GLTFComponentTypeFloat) && (accessor.dimension == GLTFValueDimensionVector4);
+    } else if ([semanticName hasPrefix:@"TEXCOORD"]) {
+        return (accessor.componentType == GLTFComponentTypeFloat) && (accessor.dimension == GLTFValueDimensionVector2);
+    }  else if ([semanticName hasPrefix:@"COLOR"]) {
+        return (accessor.componentType == GLTFComponentTypeFloat) && (accessor.dimension == GLTFValueDimensionVector3 ||
+                                                                      accessor.dimension == GLTFValueDimensionVector4);
+    } else if ([semanticName hasPrefix:@"JOINTS"]) {
+        return ((accessor.componentType == GLTFComponentTypeUnsignedShort || accessor.componentType == GLTFComponentTypeUnsignedByte) &&
+                (accessor.dimension == GLTFValueDimensionVector4));
+    } else if ([semanticName hasPrefix:@"WEIGHTS"]) {
+        return (accessor.componentType == GLTFComponentTypeFloat) && (accessor.dimension == GLTFValueDimensionVector4);
+    }
+    return NO;
+}
+
 static SCNGeometrySource *GLTFSCNGeometrySourceForAccessor(GLTFAccessor *accessor, NSString *semanticName) {
     size_t bytesPerComponent = GLTFBytesPerComponentForComponentType(accessor.componentType);
     size_t componentCount = GLTFComponentCountForDimension(accessor.dimension);
     size_t elementSize = bytesPerComponent * componentCount;
-    NSData *attrData = GLTFSCNPackedDataForAccessor(accessor);
+    BOOL floatComponents = (accessor.componentType == GLTFComponentTypeFloat);
+    NSData *attrData = GLTFPackedDataForAccessor(accessor);
+
+    if (!GLTFSCNNativelySupportsAccessor(accessor, semanticName)) {
+        attrData = GLTFTransformPackedDataToFloat(attrData, accessor);
+        bytesPerComponent = sizeof(float);
+        elementSize = bytesPerComponent * componentCount;
+        floatComponents = YES;
+    }
 
     // Ensure linear sum of weights is equal to 1; this is required by the spec,
     // and SceneKit relies on this invariant as of iOS 12 and macOS Mojave.
     // TODO: Support multiple sets of weights, assuring that sum of weights across
     // all weight sets is 1.
-    if ([semanticName isEqualToString:@"WEIGHTS_0"]) {
-        assert(accessor.componentType == GLTFComponentTypeFloat && accessor.dimension == GLTFValueDimensionVector4 &&
+    if ([semanticName isEqualToString:GLTFAttributeSemanticWeights0]) {
+        assert(floatComponents && (componentCount == 4) &&
                  "Accessor for joint weights must be of float4 type; other data types are not currently supported");
         for (int i = 0; i < accessor.count; ++i) {
             float *weights = (float *)(attrData.bytes + i * elementSize);
@@ -380,10 +377,43 @@ static SCNGeometrySource *GLTFSCNGeometrySourceForAccessor(GLTFAccessor *accesso
         }
     }
 
+    // Prior to macOS 14.0 and iOS 17.0, hit-testing against nodes whose bone indices were in ushort format
+    // did not work for GPU-skinned meshes. On older platforms, we transform from ushort indices to uchar
+    // indices iff the transform is lossless (i.e., if all indices are < 256).
+    if (@available(macOS 14.0, iOS 17.0, *)) {
+    } else {
+        if ([semanticName isEqualToString:GLTFAttributeSemanticJoints0] &&
+            accessor.componentType == GLTFComponentTypeUnsignedShort)
+        {
+            size_t totalComponentCount = componentCount * accessor.count;
+            const uint16_t *ushortIndices = attrData.bytes;
+            BOOL canTransformLosslessly = YES;
+            for (size_t i = 0; i < totalComponentCount; ++i) {
+                if (ushortIndices[i] > 255) {
+                    canTransformLosslessly = NO;
+                    break;
+                }
+            }
+            if (canTransformLosslessly) {
+                uint8_t *ucharIndices = malloc(totalComponentCount * sizeof(uint8_t));
+                for (size_t i = 0; i < totalComponentCount; ++i) {
+                    ucharIndices[i] = ushortIndices[i];
+                }
+                attrData = [NSData dataWithBytesNoCopy:ucharIndices
+                                                length:totalComponentCount * sizeof(uint8_t)
+                                          freeWhenDone:YES];
+                bytesPerComponent = sizeof(uint8_t);
+                elementSize = bytesPerComponent * componentCount;
+            } else {
+                GLTFLogWarning(@"Could not transform bone indices from ushort to uchar losslessly; hit-testing may not work as expected");
+            }
+        }
+    }
+
     return [SCNGeometrySource geometrySourceWithData:attrData
                                             semantic:GLTFSCNGeometrySourceSemanticForSemantic(semanticName)
                                          vectorCount:accessor.count
-                                     floatComponents:(accessor.componentType == GLTFComponentTypeFloat)
+                                     floatComponents:floatComponents
                                  componentsPerVector:componentCount
                                    bytesPerComponent:bytesPerComponent
                                           dataOffset:0
@@ -391,14 +421,12 @@ static SCNGeometrySource *GLTFSCNGeometrySourceForAccessor(GLTFAccessor *accesso
 }
 
 static NSArray<NSValue *> *GLTFSCNVector3ArrayForAccessor(GLTFAccessor *accessor) {
-    // TODO: This is actually not assured by the spec. We should convert from normalized int types when necessary
-    assert(accessor.componentType == GLTFComponentTypeFloat);
-    assert(accessor.dimension == GLTFValueDimensionVector3);
+    NSData *sourceData = GLTFPackedDataForAccessor(accessor);
+    sourceData = GLTFTransformPackedDataToFloat(sourceData, accessor);
     NSMutableArray *values = [NSMutableArray arrayWithCapacity:accessor.count];
-    const void *bufferViewBaseAddr = accessor.bufferView.buffer.data.bytes + accessor.bufferView.offset;
     const size_t elementSize = sizeof(float) * 3;
     for (int i = 0; i < accessor.count; ++i) {
-        const float *xyz = bufferViewBaseAddr + (i * (accessor.bufferView.stride ?: elementSize)) + accessor.offset;
+        const float *xyz = sourceData.bytes + (i * elementSize);
         NSValue *value = [NSValue valueWithSCNVector3:SCNVector3Make(xyz[0], xyz[1], xyz[2])];
         [values addObject:value];
     }
@@ -406,14 +434,12 @@ static NSArray<NSValue *> *GLTFSCNVector3ArrayForAccessor(GLTFAccessor *accessor
 }
 
 static NSArray<NSValue *> *GLTFSCNVector4ArrayForAccessor(GLTFAccessor *accessor) {
-    // TODO: This is actually not assured by the spec. We should convert from normalized int types when necessary
-    assert(accessor.componentType == GLTFComponentTypeFloat);
-    assert(accessor.dimension == GLTFValueDimensionVector4);
+    NSData *sourceData = GLTFPackedDataForAccessor(accessor);
+    sourceData = GLTFTransformPackedDataToFloat(sourceData, accessor);
     NSMutableArray *values = [NSMutableArray arrayWithCapacity:accessor.count];
-    const void *bufferViewBaseAddr = accessor.bufferView.buffer.data.bytes + accessor.bufferView.offset;
     const size_t elementSize = sizeof(float) * 4;
     for (int i = 0; i < accessor.count; ++i) {
-        const float *xyzw = bufferViewBaseAddr + (i * (accessor.bufferView.stride ?: elementSize)) + accessor.offset;
+        const float *xyzw = sourceData.bytes + (i * elementSize);
         NSValue *value = [NSValue valueWithSCNVector4:SCNVector4Make(xyzw[0], xyzw[1], xyzw[2], xyzw[3])];
         [values addObject:value];
     }
@@ -421,15 +447,14 @@ static NSArray<NSValue *> *GLTFSCNVector4ArrayForAccessor(GLTFAccessor *accessor
 }
 
 static NSArray<NSArray<NSNumber *> *> *GLTFWeightsArraysForAccessor(GLTFAccessor *accessor, NSUInteger targetCount) {
-    assert(accessor.componentType == GLTFComponentTypeFloat);
-    assert(accessor.dimension == GLTFValueDimensionScalar);
+    NSData *sourceData = GLTFPackedDataForAccessor(accessor);
+    sourceData = GLTFTransformPackedDataToFloat(sourceData, accessor);
     size_t keyframeCount = accessor.count / targetCount;
     NSMutableArray<NSMutableArray *> *weights = [NSMutableArray arrayWithCapacity:keyframeCount];
     for (int t = 0; t < targetCount; ++t) {
         [weights addObject:[NSMutableArray arrayWithCapacity:targetCount]];
     }
-    const void *bufferViewBaseAddr = accessor.bufferView.buffer.data.bytes + accessor.bufferView.offset;
-    const float *values = (float *)(bufferViewBaseAddr + accessor.offset);
+    const float *values = (float *)sourceData.bytes;
     for (int k = 0; k < keyframeCount; ++k) {
         for (int t = 0; t < targetCount; ++t) {
             [weights[t] addObject:@(values[k * targetCount + t])];
@@ -478,7 +503,9 @@ static float GLTFLuminanceFromRGBA(simd_float4 rgba) {
 
 @end
 
-@interface GLTFSCNSceneSource ()
+@interface GLTFSCNSceneSource () {
+    NSMutableDictionary<NSUUID *, id> *_materialPropertyContentsCache;
+}
 @property (nonatomic, copy) NSDictionary *properties;
 @property (nonatomic, copy) NSArray<SCNMaterial *> *materials;
 @property (nonatomic, copy) NSArray<SCNLight *> *lights;
@@ -517,6 +544,22 @@ static float GLTFLuminanceFromRGBA(simd_float4 rgba) {
     return _properties[key];
 }
 
+- (nullable id)materialPropertyContentsForTexture:(GLTFTexture *)texture {
+    if (_materialPropertyContentsCache[texture.identifier] != nil) {
+        return _materialPropertyContentsCache[texture.identifier];
+    }
+#ifdef GLTF_BUILD_WITH_KTX2
+    if (texture.basisUSource) {
+        id<MTLTexture> metalTexture = [texture.basisUSource newTextureWithDevice:MTLCreateSystemDefaultDevice()];
+        _materialPropertyContentsCache[texture.identifier] = metalTexture;
+        return metalTexture;
+    }
+#endif
+    CGImageRef cgImage = [texture.source newCGImage];
+    _materialPropertyContentsCache[texture.identifier] = (__bridge_transfer id)cgImage;
+    return (__bridge id)cgImage;
+}
+
 - (void)convertAsset {
     NSMutableDictionary *properties = [NSMutableDictionary dictionary];
     properties[GLTFAssetPropertyKeyCopyright] = self.asset.copyright;
@@ -527,11 +570,7 @@ static float GLTFLuminanceFromRGBA(simd_float4 rgba) {
     properties[GLTFAssetPropertyKeyExtensionsRequired] = self.asset.extensionsRequired;
     _properties = properties;
 
-    NSMutableDictionary<NSUUID *, id> *imagesForIdentfiers = [NSMutableDictionary dictionary];
-    for (GLTFImage *image in self.asset.images) {
-        CGImageRef cgImage = [image newCGImage];
-        imagesForIdentfiers[image.identifier] = (__bridge_transfer id)cgImage;
-    }
+    _materialPropertyContentsCache = [NSMutableDictionary dictionary];
 
     CGColorSpaceRef colorSpaceLinearSRGB = CGColorSpaceCreateWithName(kCGColorSpaceLinearSRGB);
 
@@ -543,9 +582,10 @@ static float GLTFLuminanceFromRGBA(simd_float4 rgba) {
     defaultMaterial.metalness.contents = @(1.0);
     defaultMaterial.roughness.contents = @(1.0);
 
-    NSMutableDictionary <NSUUID *, SCNMaterial *> *materialsForIdentifiers = [NSMutableDictionary dictionary];
+    NSMutableArray<SCNMaterial *> *materials = [NSMutableArray array];
     for (GLTFMaterial *material in self.asset.materials) {
         SCNMaterial *scnMaterial = [SCNMaterial new];
+        BOOL hasNonUnityBaseColorFactor = NO;
         scnMaterial.locksAmbientWithDiffuse = YES;
         if (material.isUnlit) {
             scnMaterial.lightingModelName = SCNLightingModelConstant;
@@ -559,12 +599,14 @@ static float GLTFLuminanceFromRGBA(simd_float4 rgba) {
             if (material.metallicRoughness.baseColorTexture) {
                 GLTFTextureParams *baseColorTexture = material.metallicRoughness.baseColorTexture;
                 SCNMaterialProperty *baseColorProperty = scnMaterial.diffuse;
-                baseColorProperty.contents = imagesForIdentfiers[baseColorTexture.texture.source.identifier];
+                baseColorProperty.contents = [self materialPropertyContentsForTexture:baseColorTexture.texture];
                 GLTFConfigureSCNMaterialProperty(baseColorProperty, baseColorTexture);
                 simd_float4 rgba = material.metallicRoughness.baseColorFactor;
-                // This is a lossy transformation because we only have a scalar intensity,
-                // instead of proper support for color factors.
-                baseColorProperty.intensity = GLTFLuminanceFromRGBA(rgba);
+                if (rgba[0] != 1.0 || rgba[1] != 1.0 || rgba[2] != 1.0 || rgba[3] != 1.0) {
+                    // SceneKit only supports scalar factors for material property intensities,
+                    // so we need to use a shader modifier to modulate properly.
+                    hasNonUnityBaseColorFactor = YES;
+                }
             } else {
                 SCNMaterialProperty *baseColorProperty = scnMaterial.diffuse;
                 simd_float4 rgba = material.metallicRoughness.baseColorFactor;
@@ -573,7 +615,7 @@ static float GLTFLuminanceFromRGBA(simd_float4 rgba) {
             }
             if (material.metallicRoughness.metallicRoughnessTexture) {
                 GLTFTextureParams *metallicRoughnessTexture = material.metallicRoughness.metallicRoughnessTexture;
-                id metallicRoughnessImage = imagesForIdentfiers[metallicRoughnessTexture.texture.source.identifier];
+                id metallicRoughnessImage = [self materialPropertyContentsForTexture:metallicRoughnessTexture.texture];
 
                 SCNMaterialProperty *metallicProperty = scnMaterial.metalness;
                 metallicProperty.contents = metallicRoughnessImage;
@@ -629,13 +671,13 @@ static float GLTFLuminanceFromRGBA(simd_float4 rgba) {
         if (material.normalTexture) {
             GLTFTextureParams *normalTexture = material.normalTexture;
             SCNMaterialProperty *normalProperty = scnMaterial.normal;
-            normalProperty.contents = imagesForIdentfiers[normalTexture.texture.source.identifier];
+            normalProperty.contents = [self materialPropertyContentsForTexture:normalTexture.texture];
             GLTFConfigureSCNMaterialProperty(normalProperty, normalTexture);
         }
         if (material.emissive.emissiveTexture) {
             GLTFTextureParams *emissiveTexture = material.emissive.emissiveTexture;
             SCNMaterialProperty *emissiveProperty = scnMaterial.emission;
-            emissiveProperty.contents = imagesForIdentfiers[emissiveTexture.texture.source.identifier];
+            emissiveProperty.contents = [self materialPropertyContentsForTexture:emissiveTexture.texture];
             // TODO: How to support emissive.emissiveStrength?
             GLTFConfigureSCNMaterialProperty(emissiveProperty, emissiveTexture);
         } else {
@@ -648,15 +690,16 @@ static float GLTFLuminanceFromRGBA(simd_float4 rgba) {
         if (material.occlusionTexture) {
             GLTFTextureParams *occlusionTexture = material.occlusionTexture;
             SCNMaterialProperty *occlusionProperty = scnMaterial.ambientOcclusion;
-            occlusionProperty.contents = imagesForIdentfiers[occlusionTexture.texture.source.identifier];
+            occlusionProperty.contents = [self materialPropertyContentsForTexture:occlusionTexture.texture];
             GLTFConfigureSCNMaterialProperty(occlusionProperty, occlusionTexture);
+            occlusionProperty.textureComponents = SCNColorMaskRed;
         }
         if (material.clearcoat) {
-            if (@available(macOS 10.15, iOS 13.0, *)) {
+            if (@available(macOS 10.15, iOS 13.0, tvOS 13.0, *)) {
                 if (material.clearcoat.clearcoatTexture) {
                     GLTFTextureParams *clearcoatTexture = material.clearcoat.clearcoatTexture;
                     SCNMaterialProperty *clearcoatProperty = scnMaterial.clearCoat;
-                    clearcoatProperty.contents = imagesForIdentfiers[clearcoatTexture.texture.source.identifier];
+                    clearcoatProperty.contents = [self materialPropertyContentsForTexture:clearcoatTexture.texture];
                     GLTFConfigureSCNMaterialProperty(clearcoatProperty, material.clearcoat.clearcoatTexture);
                 } else {
                     scnMaterial.clearCoat.contents = @(material.clearcoat.clearcoatFactor);
@@ -664,7 +707,7 @@ static float GLTFLuminanceFromRGBA(simd_float4 rgba) {
                 if (material.clearcoat.clearcoatRoughnessTexture) {
                     GLTFTextureParams *clearcoatRoughnessTexture = material.clearcoat.clearcoatRoughnessTexture;
                     SCNMaterialProperty *clearcoatRoughnessProperty = scnMaterial.clearCoatRoughness;
-                    clearcoatRoughnessProperty.contents = imagesForIdentfiers[clearcoatRoughnessTexture.texture.source.identifier];
+                    clearcoatRoughnessProperty.contents = [self materialPropertyContentsForTexture:clearcoatRoughnessTexture.texture];
                     GLTFConfigureSCNMaterialProperty(clearcoatRoughnessProperty, material.clearcoat.clearcoatRoughnessTexture);
                 } else {
                     scnMaterial.clearCoatRoughness.contents = @(material.clearcoat.clearcoatRoughnessFactor);
@@ -672,23 +715,53 @@ static float GLTFLuminanceFromRGBA(simd_float4 rgba) {
                 if (material.clearcoat.clearcoatNormalTexture) {
                     GLTFTextureParams *clearcoatNormalTexture = material.clearcoat.clearcoatNormalTexture;
                     SCNMaterialProperty *clearcoatNormalProperty = scnMaterial.clearCoatNormal;
-                    clearcoatNormalProperty.contents = imagesForIdentfiers[clearcoatNormalTexture.texture.source.identifier];
+                    clearcoatNormalProperty.contents = [self materialPropertyContentsForTexture:clearcoatNormalTexture.texture];
                     GLTFConfigureSCNMaterialProperty(clearcoatNormalProperty, material.clearcoat.clearcoatNormalTexture);
                 }
             }
         }
+        scnMaterial.name = material.name;
         scnMaterial.doubleSided = material.isDoubleSided;
         scnMaterial.blendMode = (material.alphaMode == GLTFAlphaModeBlend) ? SCNBlendModeAlpha : SCNBlendModeReplace;
-        scnMaterial.transparencyMode = SCNTransparencyModeDefault;
-        NSString *unpremulSurfaceDiffuse = [NSString stringWithFormat:@"if (_surface.diffuse.a > 0.0f) {\n\t_surface.diffuse.rgb /= _surface.diffuse.a;\n}"];
-        if (material.alphaMode == GLTFAlphaModeMask) {
-            NSString *alphaTestFragment = [NSString stringWithFormat:@"if (_output.color.a < %f) {\n\tdiscard_fragment();\n}", material.alphaCutoff];
-            scnMaterial.shaderModifiers = @{ SCNShaderModifierEntryPointSurface : unpremulSurfaceDiffuse,
-                                             SCNShaderModifierEntryPointFragment : alphaTestFragment };
-        } else if (material.alphaMode == GLTFAlphaModeOpaque) {
-            scnMaterial.shaderModifiers = @{ SCNShaderModifierEntryPointSurface : unpremulSurfaceDiffuse };
+        scnMaterial.transparencyMode = (material.alphaMode == GLTFAlphaModeBlend) ? SCNTransparencyModeDualLayer : SCNTransparencyModeDefault;
+
+        NSMutableString *surfaceModifier = [NSMutableString stringWithString:@""];
+        NSMutableString *fragmentModifier = [NSMutableString stringWithString:@""];
+        NSString *unpremulSurfaceDiffuse = @"if (_surface.diffuse.a > 0.0f) {\n\t_surface.diffuse.rgb /= _surface.diffuse.a;\n}";
+
+        switch (material.alphaMode) {
+            case GLTFAlphaModeOpaque:
+                [surfaceModifier appendString:unpremulSurfaceDiffuse];
+                break;
+            case GLTFAlphaModeMask:
+                [surfaceModifier appendString:unpremulSurfaceDiffuse];
+                [fragmentModifier appendFormat:@"if (_output.color.a < %f) {\n\tdiscard_fragment();\n}", material.alphaCutoff];
+                break;
+            case GLTFAlphaModeBlend:
+                // TODO: Should alpha-blended materials get unpremultiplied?
+                break;
         }
-        materialsForIdentifiers[material.identifier] = scnMaterial;
+
+        if (hasNonUnityBaseColorFactor) {
+            simd_float4 f = material.metallicRoughness.baseColorFactor;
+            if (f[3] < 1.0f) {
+                // SceneKit needs to be informed that this modifier can produce transparent fragments,
+                // even if we expressly set the blend mode to alpha.
+                surfaceModifier = [NSMutableString stringWithFormat:@"#pragma transparent\n#pragma body\n%@", surfaceModifier];
+            }
+            [surfaceModifier appendFormat:@"_surface.diffuse *= float4(%ff, %ff, %ff, %ff);\n", f[0], f[1], f[2], f[3]];
+        }
+
+        NSMutableDictionary *shaderModifiers = [NSMutableDictionary dictionary];
+        if (surfaceModifier.length > 0) {
+            shaderModifiers[SCNShaderModifierEntryPointSurface] = surfaceModifier;
+        }
+        if (fragmentModifier.length > 0) {
+            shaderModifiers[SCNShaderModifierEntryPointFragment] = fragmentModifier;
+        }
+        scnMaterial.shaderModifiers = [shaderModifiers copy];
+
+        [materials addObject:scnMaterial];
     }
 
     NSMutableDictionary <NSUUID *, SCNGeometry *> *geometryForIdentifiers = [NSMutableDictionary dictionary];
@@ -696,15 +769,23 @@ static float GLTFLuminanceFromRGBA(simd_float4 rgba) {
     for (GLTFMesh *mesh in self.asset.meshes) {
         for (GLTFPrimitive *primitive in mesh.primitives) {
             int vertexCount = 0;
-            GLTFAccessor *positionAccessor = primitive.attributes[GLTFAttributeSemanticPosition];
+            GLTFAttribute *positionAttribute = [primitive attributeForName:GLTFAttributeSemanticPosition];
+            GLTFAccessor *positionAccessor = positionAttribute.accessor;
             if (positionAccessor != nil) {
                 vertexCount = (int)positionAccessor.count;
             }
-            SCNMaterial *material = materialsForIdentifiers[primitive.material.identifier];
+            SCNMaterial *material = nil;
+            if (primitive.material) {
+                NSInteger materialIndex = [self.asset.materials indexOfObject:primitive.material];
+                if (materialIndex != NSNotFound) {
+                    material = materials[materialIndex];
+                }
+            }
             if (self.activeMaterialVariant != nil) {
                 GLTFMaterial *materialOverride = [primitive effectiveMaterialForVariant:self.activeMaterialVariant];
                 if (materialOverride) {
-                    material = materialsForIdentifiers[materialOverride.identifier];
+                    NSInteger overrideMaterialIndex = [self.asset.materials indexOfObject:materialOverride];
+                    material = materials[overrideMaterialIndex];
                 }
             }
             NSData *indexData = nil;
@@ -736,14 +817,25 @@ static float GLTFLuminanceFromRGBA(simd_float4 rgba) {
             SCNGeometryElement *element = GLTFSCNGeometryElementForIndexData(indexData, indexCount, indexSize, primitive);
             geometryElementForIdentifiers[primitive.identifier] = element;
 
-            NSMutableArray *geometrySources = [NSMutableArray arrayWithCapacity:primitive.attributes.count];
-            for (NSString *key in primitive.attributes.allKeys) {
-                GLTFAccessor *attrAccessor = primitive.attributes[key];
+            NSMutableArray *geometrySources = [NSMutableArray array];
+            for (GLTFAttribute *attribute in primitive.attributes) {
                 // TODO: Retopologize geometry source if geometry element's data is `nil`.
                 // For primitive types not supported by SceneKit (line loops, line strips, triangle
                 // fans), we retopologize the primitive's indices. However, if they aren't present,
                 // we need to adjust the vertex data.
-                [geometrySources addObject:GLTFSCNGeometrySourceForAccessor(attrAccessor, key)];
+                if ([attribute.name isEqual:@"WEIGHTS_0"] || [attribute.name isEqual:@"JOINTS_0"]) {
+                    // Omit joint indices and weights; these are stored later on the skinner
+                    continue;
+                }
+                [geometrySources addObject:GLTFSCNGeometrySourceForAccessor(attribute.accessor, attribute.name)];
+            }
+
+            bool hasNormals = [primitive attributeForName:GLTFAttributeSemanticNormal];
+            if (material.lightingModelName == SCNLightingModelPhysicallyBased && !hasNormals) {
+                static dispatch_once_t warnOnce;
+                dispatch_once(&warnOnce, ^{
+                    GLTFLogWarning(@"Primitive has a physically-based material but does not supply normals");
+                });
             }
 
             SCNGeometry *geometry = [SCNGeometry geometryWithSources:geometrySources elements:@[element]];
@@ -753,7 +845,7 @@ static float GLTFLuminanceFromRGBA(simd_float4 rgba) {
         }
     }
 
-    NSMutableDictionary<NSUUID *, SCNCamera *> *camerasForIdentifiers = [NSMutableDictionary dictionary];
+    NSMutableArray<SCNCamera *> *cameras = [NSMutableArray array];
     for (GLTFCamera *camera in self.asset.cameras) {
         SCNCamera *scnCamera = [SCNCamera camera];
         scnCamera.name = camera.name;
@@ -769,10 +861,10 @@ static float GLTFLuminanceFromRGBA(simd_float4 rgba) {
         }
         scnCamera.zNear = camera.zNear;
         scnCamera.zFar = camera.zFar;
-        camerasForIdentifiers[camera.identifier] = scnCamera;
+        [cameras addObject:scnCamera];
     }
 
-    NSMutableDictionary<NSUUID *, SCNLight *> *lightsForIdentifiers = [NSMutableDictionary dictionary];
+    NSMutableArray *lights = [NSMutableArray array];
     for (GLTFLight *light in self.asset.lights) {
         SCNLight *scnLight = [SCNLight light];
         scnLight.name = light.name;
@@ -799,7 +891,7 @@ static float GLTFLuminanceFromRGBA(simd_float4 rgba) {
             }
         }
         scnLight.castsShadow = YES;
-        lightsForIdentifiers[light.identifier] = scnLight;
+        [lights addObject:scnLight];
     }
 
     NSMutableSet *legalizedNodeNames = [NSMutableSet set];
@@ -841,10 +933,12 @@ static float GLTFLuminanceFromRGBA(simd_float4 rgba) {
         SCNNode *scnNode = nodesForIdentifiers[node.identifier];
 
         if (node.camera) {
-            scnNode.camera = camerasForIdentifiers[node.camera.identifier];
+            NSInteger cameraIndex = [self.asset.cameras indexOfObject:node.camera];
+            scnNode.camera = cameras[cameraIndex];
         }
         if (node.light) {
-            scnNode.light = lightsForIdentifiers[node.light.identifier];
+            NSInteger lightIndex = [self.asset.lights indexOfObject:node.light];
+            scnNode.light = lights[lightIndex];
         }
 
         // This collection holds the nodes to which any skin on this node should be applied,
@@ -879,47 +973,45 @@ static float GLTFLuminanceFromRGBA(simd_float4 rgba) {
                     }
 
                     SCNGeometryElement *element = geometryElementForIdentifiers[primitive.identifier];
-                    NSMutableArray<SCNGeometry *> *morphGeometries = [NSMutableArray array];
-                    int index = 0;
+                    NSMutableArray<SCNGeometry *> *morphGeometries = [NSMutableArray arrayWithCapacity:primitive.targets.count];
+                    int nameIndex = 0;
                     for (GLTFMorphTarget *target in primitive.targets) {
-                        // We assemble the list of geometry sources for each morph target by first
-                        // shallow-copying the sources of the base mesh, then replacing each source
-                        // as we encounter a corresponding key in the target's key list. In this way
-                        // we always have a 1:1 correspondence between base and target sources.
-                        NSMutableArray<SCNGeometrySource *> *sources = [geometryNode.geometry.geometrySources mutableCopy];
-                        for (NSString *key in target.allKeys) {
-                            GLTFAccessor *targetAccessor = target[key];
-                            __block NSInteger replacementIndex = NSNotFound;
-                            [sources enumerateObjectsUsingBlock:^(SCNGeometrySource *source, NSUInteger idx, BOOL * stop) {
-                                if ([source.semantic isEqualToString:GLTFSCNGeometrySourceSemanticForSemantic(key)]) {
-                                    replacementIndex = idx;
-                                    *stop = YES;
-                                }
-                            }];
-                            if (replacementIndex != NSNotFound) {
-                                [sources replaceObjectAtIndex:replacementIndex
-                                                   withObject:GLTFSCNGeometrySourceForAccessor(targetAccessor, key)];
-                            } else {
-                                // Targeting a source that doesn't exist in the base mesh. This shouldn't happen.
-                                [sources addObject:GLTFSCNGeometrySourceForAccessor(targetAccessor, key)];
+                        NSInteger targetAttributeCount = geometryNode.geometry.geometrySources.count;
+                        NSMutableArray *targetSources = [NSMutableArray arrayWithCapacity:targetAttributeCount];
+                        int texCoordChannel = 0, colorChannel = 0;
+                        for (int j = 0; j < targetAttributeCount; ++j) {
+                            SCNGeometrySource *baseSource = geometryNode.geometry.geometrySources[j];
+                            NSString *sourceSemantic = baseSource.semantic;
+                            int mappingChannel = 0;
+                            if ([sourceSemantic isEqualToString:SCNGeometrySourceSemanticTexcoord]) {
+                                mappingChannel = texCoordChannel++;
+                            } else if ([sourceSemantic isEqualToString:SCNGeometrySourceSemanticColor]) {
+                                mappingChannel = colorChannel++;
                             }
-
+                            NSString *targetAttributeName = GLTFAttributeNameForSCNGeometrySourceSemantic(sourceSemantic,
+                                                                                                          mappingChannel);
+                            NSInteger targetAttributeIndex = NSNotFound;
+                            for (int k = 0; k < target.count; ++k) {
+                                if ([target[k].name isEqualToString:targetAttributeName]) {
+                                    targetAttributeIndex = k;
+                                    break;
+                                }
+                            }
+                            if (targetAttributeIndex != NSNotFound) {
+                                GLTFAccessor *targetAttributeAccessor = target[targetAttributeIndex].accessor;
+                                SCNGeometrySource *targetSource = GLTFSCNGeometrySourceForAccessor(targetAttributeAccessor,
+                                                                                                   targetAttributeName);
+                                [targetSources addObject:targetSource];
+                            }
                         }
-                        SCNGeometry *geom = [SCNGeometry geometryWithSources:sources
-                                                                    elements:@[element]];
 
-                        // If after creating the target geometry we don't have normals, use Model I/O to generate them
-                        if ([geom geometrySourcesForSemantic:SCNGeometrySourceSemanticNormal].count == 0) {
-                            MDLMesh *mdlMesh = [MDLMesh meshWithSCNGeometry:geom];
-                            [mdlMesh addNormalsWithAttributeNamed:MDLVertexAttributeNormal creaseThreshold:0.0];
-                            geom = [SCNGeometry geometryWithMDLMesh:mdlMesh];
-                        }
+                        SCNGeometry *targetGeometry = [SCNGeometry geometryWithSources:targetSources elements:@[element]];
 
-                        if (index < node.mesh.targetNames.count) {
-                            geom.name = node.mesh.targetNames[index];
+                        if (nameIndex < node.mesh.targetNames.count) {
+                            targetGeometry.name = node.mesh.targetNames[nameIndex];
                         }
-                        index++;
-                        [morphGeometries addObject:geom];
+                        ++nameIndex;
+                        [morphGeometries addObject:targetGeometry];
                     }
 
                     SCNMorpher *scnMorpher = [SCNMorpher new];
@@ -939,9 +1031,15 @@ static float GLTFLuminanceFromRGBA(simd_float4 rgba) {
                 [bones addObject:bone];
             }
             NSArray *ibmValues = GLTFSCNMatrix4ArrayFromAccessor(node.skin.inverseBindMatrices);
-            for (SCNNode *skinnedNode in geometryNodes) {
-                SCNGeometrySource *boneWeights = [skinnedNode.geometry geometrySourcesForSemantic:SCNGeometrySourceSemanticBoneWeights].firstObject;
-                SCNGeometrySource *boneIndices = [skinnedNode.geometry geometrySourcesForSemantic:SCNGeometrySourceSemanticBoneIndices].firstObject;
+            for (int i = 0; i < geometryNodes.count; ++i) {
+                SCNNode *skinnedNode = geometryNodes[i];
+                GLTFPrimitive *sourcePrimitive = node.mesh.primitives[i];
+                GLTFAttribute *weightsAttribute = [sourcePrimitive attributeForName:GLTFAttributeSemanticWeights0];
+                SCNGeometrySource *boneWeights = GLTFSCNGeometrySourceForAccessor(weightsAttribute.accessor, 
+                                                                                  weightsAttribute.name);
+                GLTFAttribute *jointsAttribute = [sourcePrimitive attributeForName:GLTFAttributeSemanticJoints0];
+                SCNGeometrySource *boneIndices = GLTFSCNGeometrySourceForAccessor(jointsAttribute.accessor, 
+                                                                                  jointsAttribute.name);
                 if ((boneIndices.vectorCount != boneWeights.vectorCount) ||
                     ((boneIndices.data.length / boneIndices.vectorCount / boneIndices.bytesPerComponent) !=
                      (boneWeights.data.length / boneWeights.vectorCount / boneWeights.bytesPerComponent))) {
@@ -959,9 +1057,25 @@ static float GLTFLuminanceFromRGBA(simd_float4 rgba) {
                 skinnedNode.skinner = skinner;
             }
         }
+        if (node.meshInstances) {
+            NSMutableArray *instanceNodes = [NSMutableArray arrayWithCapacity:node.meshInstances.instanceCount];
+            for (int i = 0; i < node.meshInstances.instanceCount; ++i) {
+                SCNNode *instanceNode = [scnNode clone];
+                instanceNode.name = [NSString stringWithFormat:@"%@_instance%02d", scnNode.name, i];
+                instanceNode.simdTransform = [node.meshInstances transformAtIndex:i];
+                [instanceNodes addObject:instanceNode];
+            }
+            scnNode.geometry = nil;
+            while (scnNode.childNodes.count > 0) {
+                [scnNode.childNodes.firstObject removeFromParentNode];
+            }
+            for (int i = 0; i < instanceNodes.count; ++i) {
+                [scnNode addChildNode:instanceNodes[i]];
+            }
+        }
     }
 
-    NSMutableDictionary<NSUUID *, GLTFSCNAnimation *> *animationsForIdentifiers = [NSMutableDictionary dictionary];
+    NSMutableArray<GLTFSCNAnimation *> *animationPlayers = [NSMutableArray arrayWithCapacity:self.asset.animations.count];
     for (GLTFAnimation *animation in self.asset.animations) {
         NSMutableArray *caChannels = [NSMutableArray array];
         NSTimeInterval maxChannelTime = 0.0;
@@ -1063,37 +1177,42 @@ static float GLTFLuminanceFromRGBA(simd_float4 rgba) {
         GLTFSCNAnimation *gltfSCNAnimation = [GLTFSCNAnimation new];
         gltfSCNAnimation.name = animation.name;
         gltfSCNAnimation.animationPlayer = animationPlayer;
-        animationsForIdentifiers[animation.identifier] = gltfSCNAnimation;
+        [animationPlayers addObject:gltfSCNAnimation];
     }
 
-    NSMutableDictionary *scenesForIdentifiers = [NSMutableDictionary dictionary];
+    NSMutableArray *scenes = [NSMutableArray array];
     for (GLTFScene *scene in self.asset.scenes) {
         SCNScene *scnScene = [SCNScene scene];
         for (GLTFNode *rootNode in scene.nodes) {
             SCNNode *scnChildNode = nodesForIdentifiers[rootNode.identifier];
             [scnScene.rootNode addChildNode:scnChildNode];
         }
-        scenesForIdentifiers[scene.identifier] = scnScene;
+        [scenes addObject:scnScene];
     }
 
     CGColorSpaceRelease(colorSpaceLinearSRGB);
 
-    _materials = [materialsForIdentifiers allValues];
-    _lights = [lightsForIdentifiers allValues];
-    _cameras = [camerasForIdentifiers allValues];
+    _materials = [materials copy];
+    _lights = [lights copy];
+    _cameras = [cameras copy];
     _nodes = [nodesForIdentifiers allValues];
     _geometries = [geometryForIdentifiers allValues];
-    _scenes = [scenesForIdentifiers allValues];
-    _animations = [animationsForIdentifiers allValues];
+    _scenes = [scenes copy];
+    _animations = [animationPlayers copy];
 
     if (self.asset.defaultScene) {
-        _defaultScene = scenesForIdentifiers[self.asset.defaultScene.identifier];
-    } else if (self.asset.scenes.count > 0) {
-        _defaultScene = scenesForIdentifiers[self.asset.scenes.firstObject.identifier];
+        NSInteger defaultSceneIndex = [self.asset.scenes indexOfObject:self.asset.defaultScene];
+        if (defaultSceneIndex != NSNotFound) {
+            _defaultScene = self.scenes[defaultSceneIndex];
+        }
+    } else if (self.scenes.count > 0) {
+        _defaultScene = [self.scenes firstObject];
     } else {
         // Last resort. The asset doesn't contain any scenes but we're contractually obligated to return something.
         _defaultScene = [SCNScene scene];
     }
+
+    [_materialPropertyContentsCache removeAllObjects];
 }
 
 @end
